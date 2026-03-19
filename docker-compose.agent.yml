@@ -1,0 +1,9 @@
+services:
+  rathole-agent:
+    build: .
+    container_name: rathole-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./run/client.toml:/app/config.toml:ro
+    command: ["--client", "/app/config.toml"]

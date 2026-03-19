@@ -62,6 +62,13 @@ struct ApiState {
     is_server: bool,
     /// Default token from server/client config, used to auto-fill service tokens
     default_token: Option<MaskedString>,
+    /// Allowed port range for tunnel bind_addr
+    port_range: Option<(u16, u16)>,
+}
+
+/// Extract the port from a bind address like "0.0.0.0:5022".
+fn parse_bind_port(addr: &str) -> Option<u16> {
+    addr.rsplit(':').next().and_then(|p| p.parse().ok())
 }
 
 /// Read the full request body as bytes.
@@ -135,6 +142,20 @@ async fn handle_request(
                                 }
                                 if cfg.token.is_none() {
                                     return Ok(bad_request("token is required (set in body or configure default_token)"));
+                                }
+                                // Validate bind port is within allowed range
+                                if let Some((min, max)) = state.port_range {
+                                    match parse_bind_port(&cfg.bind_addr) {
+                                        Some(port) if port >= min && port <= max => {}
+                                        Some(port) => {
+                                            return Ok(bad_request(&format!(
+                                                "bind port {} is outside allowed range {}-{}", port, min, max
+                                            )));
+                                        }
+                                        None => {
+                                            return Ok(bad_request("invalid bind_addr: cannot parse port"));
+                                        }
+                                    }
                                 }
                                 let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                                 let bind_addr = cfg.bind_addr.clone();
@@ -228,12 +249,18 @@ pub async fn start(
         .parse()
         .with_context(|| format!("Invalid API bind address: {}", config.bind_addr))?;
 
+    let port_range = match (config.port_range_min, config.port_range_max) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    };
+
     let state = Arc::new(ApiState {
         event_tx,
         registry,
         token: config.token.map(|t| t.to_string()),
         is_server,
         default_token,
+        port_range,
     });
 
     let listener = TcpListener::bind(addr)

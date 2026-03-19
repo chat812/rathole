@@ -1,0 +1,9 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[api]
+bind_addr = "0.0.0.0:9090"
+# token = "my-api-token"
+port_range_min = 10000
+port_range_max = 14000

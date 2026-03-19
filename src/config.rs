@@ -247,6 +247,10 @@ pub struct ApiConfig {
     pub bind_addr: String,
     /// Optional bearer token for authentication
     pub token: Option<MaskedString>,
+    /// Minimum allowed bind port for tunnels (inclusive)
+    pub port_range_min: Option<u16>,
+    /// Maximum allowed bind port for tunnels (inclusive)
+    pub port_range_max: Option<u16>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
