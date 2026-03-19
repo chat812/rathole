@@ -6,7 +6,7 @@ use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, write_control_cmd, Ack, ControlChannelCmd, DataChannelCmd, Hello,
-    ServicePushConfig, UdpTraffic, HASH_WIDTH_IN_BYTES,
+    ServicePushConfig, UdpTraffic, GATEWAY_SERVICE_NAME, HASH_WIDTH_IN_BYTES,
 };
 use crate::registry::{RegistryGuard, ServiceRegistry};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
@@ -132,7 +132,22 @@ impl<T: 'static + Transport> Server<T> {
         }
 
         let config = Arc::new(config);
-        let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
+        let mut services_map = generate_service_hashmap(&config);
+
+        // Register the gateway service so gateway clients can connect
+        if config.default_token.is_some() {
+            let gateway_cfg = ServerServiceConfig {
+                service_type: ServiceType::Tcp,
+                name: GATEWAY_SERVICE_NAME.to_string(),
+                bind_addr: String::new(), // No listener for gateway
+                token: config.default_token.clone(),
+                nodelay: None,
+                local_addr: None,
+            };
+            services_map.insert(protocol::gateway_digest(), gateway_cfg);
+        }
+
+        let services = Arc::new(RwLock::new(services_map));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {
@@ -490,6 +505,8 @@ where
         heartbeat_interval: u64,
         registry: Arc<ServiceRegistry>,
     ) -> ControlChannelHandle<T> {
+        let is_gateway = service.name == GATEWAY_SERVICE_NAME;
+
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -499,54 +516,57 @@ where
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
-        // Cache some data channels for later use
-        let pool_size = match service.service_type {
-            ServiceType::Tcp => TCP_POOL_SIZE,
-            ServiceType::Udp => UDP_POOL_SIZE,
-        };
+        // Only create connection pool for non-gateway services
+        if !is_gateway {
+            // Cache some data channels for later use
+            let pool_size = match service.service_type {
+                ServiceType::Tcp => TCP_POOL_SIZE,
+                ServiceType::Udp => UDP_POOL_SIZE,
+            };
 
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
+            for _i in 0..pool_size {
+                if let Err(e) = data_ch_req_tx.send(true) {
+                    error!("Failed to request data channel {}", e);
+                };
+            }
+
+            let shutdown_rx_clone = shutdown_tx.subscribe();
+            let bind_addr = service.bind_addr.clone();
+            match service.service_type {
+                ServiceType::Tcp => tokio::spawn(
+                    async move {
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                ),
+                ServiceType::Udp => tokio::spawn(
+                    async move {
+                        if let Err(e) = run_udp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                ),
             };
         }
-
-        let shutdown_rx_clone = shutdown_tx.subscribe();
-        let bind_addr = service.bind_addr.clone();
-        match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-        };
 
         // Channel for pushing commands from server to client
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

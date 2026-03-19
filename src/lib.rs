@@ -111,6 +111,16 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                         #[cfg(feature = "api")]
                         if let Some(api_cfg) = config.api.clone() {
                             let is_server = config.server.is_some();
+                            let default_token = config
+                                .server
+                                .as_ref()
+                                .and_then(|s| s.default_token.clone())
+                                .or_else(|| {
+                                    config
+                                        .client
+                                        .as_ref()
+                                        .and_then(|c| c.default_token.clone())
+                                });
                             let api_tx = api_event_tx.clone();
                             let api_registry = registry.clone();
                             let api_shutdown = shutdown_tx.subscribe();
@@ -121,6 +131,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                     api_registry,
                                     api_shutdown,
                                     is_server,
+                                    default_token,
                                 ).await {
                                     error!("API server error: {:#}", e);
                                 }

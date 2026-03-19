@@ -1,4 +1,4 @@
-use crate::config::{ApiConfig, ClientServiceConfig, ServerServiceConfig};
+use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig};
 use crate::config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
 use crate::registry::ServiceRegistry;
 
@@ -60,6 +60,8 @@ struct ApiState {
     registry: Arc<ServiceRegistry>,
     token: Option<String>,
     is_server: bool,
+    /// Default token from server/client config, used to auto-fill service tokens
+    default_token: Option<MaskedString>,
 }
 
 /// Read the full request body as bytes.
@@ -127,9 +129,12 @@ async fn handle_request(
                         match serde_json::from_slice::<ServerServiceConfig>(&body) {
                             Ok(mut cfg) => {
                                 cfg.name = name.clone();
-                                // Ensure token is set
+                                // Auto-fill token from default_token if not provided
                                 if cfg.token.is_none() {
-                                    return Ok(bad_request("token is required"));
+                                    cfg.token = state.default_token.clone();
+                                }
+                                if cfg.token.is_none() {
+                                    return Ok(bad_request("token is required (set in body or configure default_token)"));
                                 }
                                 let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                                 let bind_addr = cfg.bind_addr.clone();
@@ -216,6 +221,7 @@ pub async fn start(
     registry: Arc<ServiceRegistry>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     is_server: bool,
+    default_token: Option<MaskedString>,
 ) -> Result<()> {
     let addr: SocketAddr = config
         .bind_addr
@@ -227,6 +233,7 @@ pub async fn start(
         registry,
         token: config.token.map(|t| t.to_string()),
         is_server,
+        default_token,
     });
 
     let listener = TcpListener::bind(addr)

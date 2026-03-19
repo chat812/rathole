@@ -159,6 +159,16 @@ pub fn digest(data: &[u8]) -> Digest {
     d.into()
 }
 
+/// Well-known service name for gateway control channels.
+/// Clients in gateway mode use this to establish a control channel
+/// without needing any pre-configured services.
+pub const GATEWAY_SERVICE_NAME: &str = "__gateway__";
+
+/// Returns the digest for the gateway service.
+pub fn gateway_digest() -> Digest {
+    digest(GATEWAY_SERVICE_NAME.as_bytes())
+}
+
 #[allow(dead_code)]
 struct PacketLength {
     hello: usize,

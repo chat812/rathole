@@ -208,6 +208,7 @@ pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
     pub prefer_ipv6: Option<bool>,
+    #[serde(default)]
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -215,6 +216,10 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    /// Enable gateway mode. Client connects with no services and receives
+    /// all tunnel configs from the server. Defaults to true when services is empty.
+    #[serde(default)]
+    pub gateway: Option<bool>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -288,6 +293,16 @@ impl Config {
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        // Auto-enable gateway mode when no services are defined
+        if client.gateway.is_none() && client.services.is_empty() {
+            client.gateway = Some(true);
+        }
+
+        // Gateway mode requires default_token
+        if client.gateway == Some(true) && client.default_token.is_none() {
+            bail!("`default_token` is required in gateway mode (no services defined)");
+        }
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();

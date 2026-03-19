@@ -6,7 +6,7 @@ use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, GATEWAY_SERVICE_NAME, HASH_WIDTH_IN_BYTES,
 };
 use crate::registry::ServiceRegistry;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
@@ -122,6 +122,30 @@ impl<T: 'static + Transport> Client<T> {
     ) -> Result<()> {
         // Channel for server-pushed config changes from control channels
         let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<ConfigChange>();
+
+        // In gateway mode, open a single gateway control channel
+        // that receives all tunnel configs from the server
+        if self.config.gateway == Some(true) {
+            info!("Starting in gateway mode — waiting for server to push tunnels");
+            let gateway_cfg = ClientServiceConfig {
+                name: GATEWAY_SERVICE_NAME.to_string(),
+                local_addr: String::new(), // Not used for the gateway channel itself
+                service_type: ServiceType::Tcp,
+                token: self.config.default_token.clone(),
+                nodelay: None,
+                prefer_ipv6: false,
+                retry_interval: Some(self.config.retry_interval),
+            };
+            let handle = ControlChannelHandle::new(
+                gateway_cfg,
+                self.config.remote_addr.clone(),
+                self.transport.clone(),
+                self.config.heartbeat_timeout,
+                push_event_tx.clone(),
+            );
+            self.service_handles
+                .insert(GATEWAY_SERVICE_NAME.to_string(), handle);
+        }
 
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
