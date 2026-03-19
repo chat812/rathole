@@ -203,7 +203,16 @@ impl<T: 'static + Transport> Client<T> {
     ) {
         match e {
             ConfigChange::ClientChange(client_change) => match client_change {
-                ClientServiceChange::Add(cfg) => {
+                ClientServiceChange::Add(mut cfg) => {
+                    // If server pushed without local_addr, fall back to own local config
+                    if cfg.local_addr.is_empty() {
+                        if let Some(local_svc) = self.config.services.get(&cfg.name) {
+                            cfg.local_addr = local_svc.local_addr.clone();
+                        } else {
+                            warn!("Ignoring pushed service {} — no local_addr from server and none in local config", cfg.name);
+                            return;
+                        }
+                    }
                     let name = cfg.name.clone();
                     let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                     let local_addr = cfg.local_addr.clone();
@@ -545,22 +554,18 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         ControlChannelCmd::HeartBeat => (),
                         ControlChannelCmd::AddService(push_cfg) => {
                             info!("Server pushed AddService: {}", push_cfg.name);
-                            if push_cfg.local_addr.is_empty() {
-                                warn!("Ignoring pushed service {} with empty local_addr", push_cfg.name);
-                            } else {
-                                let client_cfg = ClientServiceConfig {
-                                    name: push_cfg.name.clone(),
-                                    local_addr: push_cfg.local_addr,
-                                    service_type: push_cfg.service_type,
-                                    token: Some(MaskedString::from(push_cfg.token.as_str())),
-                                    nodelay: push_cfg.nodelay,
-                                    prefer_ipv6: false,
-                                    retry_interval: Some(1), // Default retry interval
-                                };
-                                let _ = self.push_event_tx.send(
-                                    ConfigChange::ClientChange(ClientServiceChange::Add(client_cfg))
-                                );
-                            }
+                            let client_cfg = ClientServiceConfig {
+                                name: push_cfg.name.clone(),
+                                local_addr: push_cfg.local_addr,
+                                service_type: push_cfg.service_type,
+                                token: Some(MaskedString::from(push_cfg.token.as_str())),
+                                nodelay: push_cfg.nodelay,
+                                prefer_ipv6: false,
+                                retry_interval: Some(1),
+                            };
+                            let _ = self.push_event_tx.send(
+                                ConfigChange::ClientChange(ClientServiceChange::Add(client_cfg))
+                            );
                         },
                         ControlChannelCmd::RemoveService(name) => {
                             info!("Server pushed RemoveService: {}", name);

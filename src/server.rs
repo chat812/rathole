@@ -260,29 +260,39 @@ impl<T: 'static + Transport> Server<T> {
                         .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type)
                         .await;
 
-                    // Push AddService to all connected clients (only if local_addr is set)
-                    if cfg.local_addr.is_some() {
-                        let push_cfg = ServicePushConfig {
-                            name: cfg.name.clone(),
-                            local_addr: cfg.local_addr.clone().unwrap_or_default(),
-                            service_type: cfg.service_type,
-                            token: cfg
-                                .token
-                                .as_ref()
-                                .map(|t| t.to_string())
-                                .unwrap_or_default(),
-                            nodelay: cfg.nodelay,
-                        };
-                        let cmd = ControlChannelCmd::AddService(push_cfg);
-                        let channels = self.control_channels.read().await;
-                        for handle in channels.values() {
-                            let _ = handle.cmd_tx.send(cmd.clone());
-                        }
-                    }
+                    // Build push config before moving cfg into the services map
+                    let push_cfg = ServicePushConfig {
+                        name: cfg.name.clone(),
+                        local_addr: cfg.local_addr.clone().unwrap_or_default(),
+                        service_type: cfg.service_type,
+                        token: cfg
+                            .token
+                            .as_ref()
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        nodelay: cfg.nodelay,
+                    };
 
                     let hash = protocol::digest(cfg.name.as_bytes());
-                    let mut wg = self.services.write().await;
-                    let _ = wg.insert(hash, cfg);
+
+                    // Insert into services map first so clients can authenticate when they connect back
+                    {
+                        let mut wg = self.services.write().await;
+                        let _ = wg.insert(hash, cfg);
+                    }
+
+                    // Push AddService to gateway clients only — service-specific channels
+                    // must not receive pushes or they loop (they'd drop and reconnect for
+                    // the same service, which triggers another push, ad infinitum)
+                    let cmd = ControlChannelCmd::AddService(push_cfg);
+                    {
+                        let channels = self.control_channels.read().await;
+                        for handle in channels.values() {
+                            if handle.service.name == GATEWAY_SERVICE_NAME {
+                                let _ = handle.cmd_tx.send(cmd.clone());
+                            }
+                        }
+                    }
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
@@ -290,12 +300,14 @@ impl<T: 'static + Transport> Server<T> {
                 ServerServiceChange::Delete(s) => {
                     self.registry.unregister(&s).await;
 
-                    // Push RemoveService to all connected clients
+                    // Push RemoveService to gateway clients only
                     let cmd = ControlChannelCmd::RemoveService(s.clone());
                     {
                         let channels = self.control_channels.read().await;
                         for handle in channels.values() {
-                            let _ = handle.cmd_tx.send(cmd.clone());
+                            if handle.service.name == GATEWAY_SERVICE_NAME {
+                                let _ = handle.cmd_tx.send(cmd.clone());
+                            }
                         }
                     }
 
@@ -424,26 +436,29 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             registry,
         );
 
-        // Push all existing services with local_addr to the newly connected client
-        {
+        // Push all existing services to a newly connected GATEWAY client only.
+        // Service-specific channels must not receive pushes — they would loop
+        // by dropping and reconnecting for the same service.
+        if handle.service.name == GATEWAY_SERVICE_NAME {
             let svcs = services.read().await;
             for svc in svcs.values() {
-                if let Some(ref local_addr) = svc.local_addr {
-                    let push_cfg = ServicePushConfig {
-                        name: svc.name.clone(),
-                        local_addr: local_addr.clone(),
-                        service_type: svc.service_type,
-                        token: svc
-                            .token
-                            .as_ref()
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        nodelay: svc.nodelay,
-                    };
-                    let _ = handle
-                        .cmd_tx
-                        .send(ControlChannelCmd::AddService(push_cfg));
+                if svc.name == GATEWAY_SERVICE_NAME {
+                    continue;
                 }
+                let push_cfg = ServicePushConfig {
+                    name: svc.name.clone(),
+                    local_addr: svc.local_addr.clone().unwrap_or_default(),
+                    service_type: svc.service_type,
+                    token: svc
+                        .token
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                    nodelay: svc.nodelay,
+                };
+                let _ = handle
+                    .cmd_tx
+                    .send(ControlChannelCmd::AddService(push_cfg));
             }
         }
 
@@ -490,6 +505,8 @@ pub struct ControlChannelHandle<T: Transport> {
     cmd_tx: mpsc::UnboundedSender<ControlChannelCmd>,
     // Marks service as disconnected when dropped
     _registry_guard: RegistryGuard,
+    // Keep the data channel request sender alive (gateway channels have no pool to hold it)
+    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -532,13 +549,14 @@ where
 
             let shutdown_rx_clone = shutdown_tx.subscribe();
             let bind_addr = service.bind_addr.clone();
+            let pool_req_tx = data_ch_req_tx.clone();
             match service.service_type {
                 ServiceType::Tcp => tokio::spawn(
                     async move {
                         if let Err(e) = run_tcp_connection_pool::<T>(
                             bind_addr,
                             data_ch_rx,
-                            data_ch_req_tx,
+                            pool_req_tx,
                             shutdown_rx_clone,
                         )
                         .await
@@ -554,7 +572,7 @@ where
                         if let Err(e) = run_udp_connection_pool::<T>(
                             bind_addr,
                             data_ch_rx,
-                            data_ch_req_tx,
+                            pool_req_tx,
                             shutdown_rx_clone,
                         )
                         .await
@@ -598,6 +616,7 @@ where
             data_ch_tx,
             service,
             cmd_tx,
+            _data_ch_req_tx: data_ch_req_tx,
             _registry_guard: registry_guard,
         }
     }

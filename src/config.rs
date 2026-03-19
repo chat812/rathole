@@ -231,6 +231,7 @@ fn default_heartbeat_interval() -> u64 {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub default_token: Option<MaskedString>,
+    #[serde(default)]
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
