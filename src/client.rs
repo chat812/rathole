@@ -1,4 +1,6 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{
+    ClientConfig, ClientServiceConfig, Config, MaskedString, ServiceType, TransportType,
+};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
@@ -6,6 +8,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
+use crate::registry::ServiceRegistry;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -35,6 +38,7 @@ pub async fn run_client(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+    registry: Arc<ServiceRegistry>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -44,13 +48,13 @@ pub async fn run_client(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config).await?;
+            let mut client = Client::<TcpTransport>::from(config, registry).await?;
             client.run(shutdown_rx, update_rx).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut client = Client::<TlsTransport>::from(config).await?;
+                let mut client = Client::<TlsTransport>::from(config, registry).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -59,7 +63,7 @@ pub async fn run_client(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut client = Client::<NoiseTransport>::from(config).await?;
+                let mut client = Client::<NoiseTransport>::from(config, registry).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
@@ -68,7 +72,7 @@ pub async fn run_client(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut client = Client::<WebsocketTransport>::from(config).await?;
+                let mut client = Client::<WebsocketTransport>::from(config, registry).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -85,17 +89,28 @@ struct Client<T: Transport> {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
+    registry: Arc<ServiceRegistry>,
 }
 
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
-    async fn from(config: ClientConfig) -> Result<Client<T>> {
+    async fn from(config: ClientConfig, registry: Arc<ServiceRegistry>) -> Result<Client<T>> {
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
+
+        // Register initial services
+        for (name, svc) in &config.services {
+            let svc_type = format!("{:?}", svc.service_type).to_lowercase();
+            registry
+                .register(name.clone(), svc.local_addr.clone(), svc_type)
+                .await;
+        }
+
         Ok(Client {
             config,
             service_handles: HashMap::new(),
             transport,
+            registry,
         })
     }
 
@@ -105,6 +120,9 @@ impl<T: 'static + Transport> Client<T> {
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
+        // Channel for server-pushed config changes from control channels
+        let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<ConfigChange>();
+
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
             let handle = ControlChannelHandle::new(
@@ -112,9 +130,13 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                push_event_tx.clone(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
+
+        // Store push_event_tx for creating new handles during hot reload
+        let push_tx = push_event_tx;
 
         // Wait for the shutdown signal
         loop {
@@ -130,7 +152,13 @@ impl<T: 'static + Transport> Client<T> {
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                        self.handle_hot_reload(e, push_tx.clone()).await;
+                    }
+                },
+                e = push_event_rx.recv() => {
+                    if let Some(e) = e {
+                        info!("Processing server-pushed config change: {:?}", e);
+                        self.handle_hot_reload(e, push_tx.clone()).await;
                     }
                 }
             }
@@ -144,20 +172,32 @@ impl<T: 'static + Transport> Client<T> {
         Ok(())
     }
 
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
+    async fn handle_hot_reload(
+        &mut self,
+        e: ConfigChange,
+        push_event_tx: mpsc::UnboundedSender<ConfigChange>,
+    ) {
         match e {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
+                    let local_addr = cfg.local_addr.clone();
+                    self.registry
+                        .register(name.clone(), local_addr, svc_type)
+                        .await;
+
                     let handle = ControlChannelHandle::new(
                         cfg,
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        push_event_tx,
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
                 ClientServiceChange::Delete(s) => {
+                    self.registry.unregister(&s).await;
                     let _ = self.service_handles.remove(&s);
                 }
             },
@@ -392,6 +432,7 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    push_event_tx: mpsc::UnboundedSender<ConfigChange>, // Forward server-pushed commands
 }
 
 // Handle of a control channel
@@ -477,7 +518,28 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             }.instrument(Span::current()));
                         },
-                        ControlChannelCmd::HeartBeat => ()
+                        ControlChannelCmd::HeartBeat => (),
+                        ControlChannelCmd::AddService(push_cfg) => {
+                            info!("Server pushed AddService: {}", push_cfg.name);
+                            let client_cfg = ClientServiceConfig {
+                                name: push_cfg.name.clone(),
+                                local_addr: push_cfg.local_addr,
+                                service_type: push_cfg.service_type,
+                                token: Some(MaskedString::from(push_cfg.token.as_str())),
+                                nodelay: push_cfg.nodelay,
+                                prefer_ipv6: false,
+                                retry_interval: None,
+                            };
+                            let _ = self.push_event_tx.send(
+                                ConfigChange::ClientChange(ClientServiceChange::Add(client_cfg))
+                            );
+                        },
+                        ControlChannelCmd::RemoveService(name) => {
+                            info!("Server pushed RemoveService: {}", name);
+                            let _ = self.push_event_tx.send(
+                                ConfigChange::ClientChange(ClientServiceChange::Delete(name))
+                            );
+                        },
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
@@ -501,6 +563,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        push_event_tx: mpsc::UnboundedSender<ConfigChange>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -516,6 +579,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            push_event_tx,
         };
 
         tokio::spawn(

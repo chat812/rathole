@@ -5,9 +5,10 @@ use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    self, read_auth, read_hello, write_control_cmd, Ack, ControlChannelCmd, DataChannelCmd, Hello,
+    ServicePushConfig, UdpTraffic, HASH_WIDTH_IN_BYTES,
 };
+use crate::registry::{RegistryGuard, ServiceRegistry};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -43,6 +44,7 @@ pub async fn run_server(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+    registry: Arc<ServiceRegistry>,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -53,13 +55,13 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config).await?;
+            let mut server = Server::<TcpTransport>::from(config, registry).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config).await?;
+                let mut server = Server::<TlsTransport>::from(config, registry).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -68,7 +70,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config).await?;
+                let mut server = Server::<NoiseTransport>::from(config, registry).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -77,7 +79,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, registry).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -99,10 +101,12 @@ struct Server<T: Transport> {
 
     // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    // Collection of contorl channels
+    // Collection of control channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Service registry for tracking service state
+    registry: Arc<ServiceRegistry>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -118,7 +122,15 @@ fn generate_service_hashmap(
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub async fn from(config: ServerConfig, registry: Arc<ServiceRegistry>) -> Result<Server<T>> {
+        // Register initial services
+        for (name, svc) in &config.services {
+            let svc_type = format!("{:?}", svc.service_type).to_lowercase();
+            registry
+                .register(name.clone(), svc.bind_addr.clone(), svc_type)
+                .await;
+        }
+
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
@@ -128,6 +140,7 @@ impl<T: 'static + Transport> Server<T> {
             services,
             control_channels,
             transport,
+            registry,
         })
     }
 
@@ -187,8 +200,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
+                                            let registry = self.registry.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -226,6 +240,31 @@ impl<T: 'static + Transport> Server<T> {
         match e {
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
+                    let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
+                    self.registry
+                        .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type)
+                        .await;
+
+                    // Push AddService to all connected clients
+                    let push_cfg = ServicePushConfig {
+                        name: cfg.name.clone(),
+                        local_addr: String::new(), // Client must configure this
+                        service_type: cfg.service_type,
+                        token: cfg
+                            .token
+                            .as_ref()
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        nodelay: cfg.nodelay,
+                    };
+                    let cmd = ControlChannelCmd::AddService(push_cfg);
+                    {
+                        let channels = self.control_channels.read().await;
+                        for handle in channels.values() {
+                            let _ = handle.cmd_tx.send(cmd.clone());
+                        }
+                    }
+
                     let hash = protocol::digest(cfg.name.as_bytes());
                     let mut wg = self.services.write().await;
                     let _ = wg.insert(hash, cfg);
@@ -234,6 +273,17 @@ impl<T: 'static + Transport> Server<T> {
                     let _ = wg.remove1(&hash);
                 }
                 ServerServiceChange::Delete(s) => {
+                    self.registry.unregister(&s).await;
+
+                    // Push RemoveService to all connected clients
+                    let cmd = ControlChannelCmd::RemoveService(s.clone());
+                    {
+                        let channels = self.control_channels.read().await;
+                        for handle in channels.values() {
+                            let _ = handle.cmd_tx.send(cmd.clone());
+                        }
+                    }
+
                     let hash = protocol::digest(s.as_bytes());
                     let _ = self.services.write().await.remove(&hash);
 
@@ -252,6 +302,7 @@ async fn handle_connection<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    registry: Arc<ServiceRegistry>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -263,6 +314,7 @@ async fn handle_connection<T: 'static + Transport>(
                 control_channels,
                 service_digest,
                 server_config,
+                registry,
             )
             .await?;
         }
@@ -279,6 +331,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    registry: Arc<ServiceRegistry>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -348,8 +401,13 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        registry.set_active(&service_config.name).await;
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            registry,
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -390,6 +448,10 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
+    // Send push commands (AddService/RemoveService) to the control channel
+    cmd_tx: mpsc::UnboundedSender<ControlChannelCmd>,
+    // Marks service as disconnected when dropped
+    _registry_guard: RegistryGuard,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -403,6 +465,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        registry: Arc<ServiceRegistry>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -462,12 +525,19 @@ where
             ),
         };
 
+        // Channel for pushing commands from server to client
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        // Create a registry guard that marks service disconnected on drop
+        let registry_guard = RegistryGuard::new(registry, service.name.clone());
+
         // Create the control channel
         let ch = ControlChannel::<T> {
             conn,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            cmd_rx,
         };
 
         // Run the control channel
@@ -484,38 +554,32 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            cmd_tx,
+            _registry_guard: registry_guard,
         }
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
+// Control channel, using T as the transport layer
 struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    shutdown_rx: broadcast::Receiver<bool>,         // Receives the shutdown signal
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>,  // Receives visitor connections
+    heartbeat_interval: u64,                        // Application-layer heartbeat interval in secs
+    cmd_rx: mpsc::UnboundedReceiver<ControlChannelCmd>, // Receives push commands for the client
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
-
-        // Wait for data channel requests and the shutdown signal
+        // Wait for data channel requests, push commands, and the shutdown signal
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = write_control_cmd(&mut self.conn, &ControlChannelCmd::CreateDataChannel).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -525,11 +589,25 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
-                                error!("{:#}", e);
+                // Push commands from server to client
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            if let Err(e) = write_control_cmd(&mut self.conn, &cmd).await {
+                                error!("Failed to push command: {:#}", e);
                                 break;
                             }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                },
+                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                    if let Err(e) = write_control_cmd(&mut self.conn, &ControlChannelCmd::HeartBeat).await {
+                        error!("{:#}", e);
+                        break;
+                    }
                 }
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {

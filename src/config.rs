@@ -229,11 +229,22 @@ pub struct ServerConfig {
     pub heartbeat_interval: u64,
 }
 
+/// Configuration for the runtime REST API.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    /// Address to bind the API server (e.g. "127.0.0.1:9090")
+    pub bind_addr: String,
+    /// Optional bearer token for authentication
+    pub token: Option<MaskedString>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
+    pub api: Option<ApiConfig>,
 }
 
 impl Config {

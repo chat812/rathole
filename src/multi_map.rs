@@ -105,6 +105,14 @@ where
         self.map1.remove(&item.0);
         Some(item.2)
     }
+
+    /// Iterate over all values in the map.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.map1.values().map(|item| {
+            let item = unsafe { &*item.0 };
+            &item.2
+        })
+    }
 }
 
 impl<K1, K2, V> Drop for MultiMap<K1, K2, V> {

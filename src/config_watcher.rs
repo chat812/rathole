@@ -200,7 +200,16 @@ async fn config_watcher(
 }
 
 fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
-    if old == new {
+    // Compare ignoring `api` field changes (API config doesn't trigger restart)
+    let old_comparable = Config {
+        api: None,
+        ..old.clone()
+    };
+    let new_comparable = Config {
+        api: None,
+        ..new.clone()
+    };
+    if old_comparable == new_comparable {
         return None;
     }
 
@@ -287,10 +296,12 @@ mod test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    api: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: Some(Default::default()),
+                    api: None,
                 },
             },
             Test {
@@ -300,6 +311,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    api: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -308,12 +320,14 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    api: None,
                 },
             },
             Test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    api: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -321,6 +335,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    api: None,
                 },
             },
             Test {
@@ -330,10 +345,12 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    api: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: None,
+                    api: None,
                 },
             },
             Test {
@@ -346,6 +363,7 @@ mod test {
                         services: collection!(String::from("foo1") => ClientServiceConfig::with_name("foo1"), String::from("foo2") => ClientServiceConfig::with_name("foo2")),
                         ..Default::default()
                     }),
+                    api: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -356,6 +374,7 @@ mod test {
                         services: collection!(String::from("bar1") => ClientServiceConfig::with_name("bar1"), String::from("bar2") => ClientServiceConfig::with_name("bar2")),
                         ..Default::default()
                     }),
+                    api: None,
                 },
             },
         ];
@@ -416,10 +435,12 @@ mod test {
                 &Config {
                     server: Default::default(),
                     client: None,
+                    api: None,
                 },
                 &Config {
                     server: Default::default(),
                     client: None,
+                    api: None,
                 },
             ),
             None

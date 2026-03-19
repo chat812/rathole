@@ -18,6 +18,7 @@ default = [
     "noise",
     "websocket-native-tls",
     "hot-reload",
+    "api",
 ]
 
 # Run as a server
@@ -55,6 +56,9 @@ websocket-rustls = [
 
 # Configuration hot-reload support
 hot-reload = ["notify"]
+
+# Runtime REST API
+api = ["hyper", "hyper-util", "http-body-util", "serde_json"]
 
 # Default feature releasing embedded devices
 # Cross-compiling with tls is hard. So we don't :(
@@ -106,6 +110,10 @@ snowstorm = { version = "0.4", optional = true, features = [
 ], default-features = false }
 base64 = { version = "0.13", optional = true }
 notify = { version = "5.0.0-pre.13", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+serde_json = { version = "1", optional = true }
 console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",
 ] }

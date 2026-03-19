@@ -1,3 +1,5 @@
+#[cfg(feature = "api")]
+mod api;
 mod cli;
 mod config;
 mod config_watcher;
@@ -5,6 +7,7 @@ mod constants;
 mod helper;
 mod multi_map;
 mod protocol;
+mod registry;
 mod transport;
 
 pub use cli::Cli;
@@ -13,8 +16,11 @@ pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
+
+use crate::registry::ServiceRegistry;
 
 #[cfg(feature = "client")]
 mod client;
@@ -74,36 +80,81 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);
 
+    // Service registry shared across API server and instances
+    let registry = Arc::new(ServiceRegistry::new());
+
+    // Channel for API-originated config changes
+    let (api_event_tx, mut api_event_rx) =
+        mpsc::unbounded_channel::<ConfigChange>();
+
     // (The join handle of the last instance, The service update channel sender)
     let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
 
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
-        match e {
-            ConfigChange::General(config) => {
-                if let Some((i, _)) = last_instance {
-                    info!("General configuration change detected. Restarting...");
-                    shutdown_tx.send(true)?;
-                    i.await??;
+    loop {
+        tokio::select! {
+            e = cfg_watcher.event_rx.recv() => {
+                let e = match e {
+                    Some(e) => e,
+                    None => break,
+                };
+                match e {
+                    ConfigChange::General(config) => {
+                        if let Some((i, _)) = last_instance.take() {
+                            info!("General configuration change detected. Restarting...");
+                            shutdown_tx.send(true)?;
+                            i.await??;
+                        }
+
+                        debug!("{:?}", config);
+
+                        // Start API server if configured
+                        #[cfg(feature = "api")]
+                        if let Some(api_cfg) = config.api.clone() {
+                            let is_server = config.server.is_some();
+                            let api_tx = api_event_tx.clone();
+                            let api_registry = registry.clone();
+                            let api_shutdown = shutdown_tx.subscribe();
+                            tokio::spawn(async move {
+                                if let Err(e) = api::start(
+                                    api_cfg,
+                                    api_tx,
+                                    api_registry,
+                                    api_shutdown,
+                                    is_server,
+                                ).await {
+                                    error!("API server error: {:#}", e);
+                                }
+                            });
+                        }
+
+                        let (service_update_tx, service_update_rx) = mpsc::channel(1024);
+
+                        last_instance = Some((
+                            tokio::spawn(run_instance(
+                                *config,
+                                args.clone(),
+                                shutdown_tx.subscribe(),
+                                service_update_rx,
+                                registry.clone(),
+                            )),
+                            service_update_tx,
+                        ));
+                    }
+                    ev => {
+                        info!("Service change detected. {:?}", ev);
+                        if let Some((_, service_update_tx)) = &last_instance {
+                            let _ = service_update_tx.send(ev).await;
+                        }
+                    }
                 }
-
-                debug!("{:?}", config);
-
-                let (service_update_tx, service_update_rx) = mpsc::channel(1024);
-
-                last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        args.clone(),
-                        shutdown_tx.subscribe(),
-                        service_update_rx,
-                    )),
-                    service_update_tx,
-                ));
-            }
-            ev => {
-                info!("Service change detected. {:?}", ev);
-                if let Some((_, service_update_tx)) = &last_instance {
-                    let _ = service_update_tx.send(ev).await;
+            },
+            // API-originated config changes
+            e = api_event_rx.recv() => {
+                if let Some(ev) = e {
+                    info!("API service change: {:?}", ev);
+                    if let Some((_, service_update_tx)) = &last_instance {
+                        let _ = service_update_tx.send(ev).await;
+                    }
                 }
             }
         }
@@ -119,6 +170,7 @@ async fn run_instance(
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
+    registry: Arc<ServiceRegistry>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -126,13 +178,13 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, shutdown_rx, service_update, registry).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update).await
+            run_server(config, shutdown_rx, service_update, registry).await
         }
     }
 }
@@ -240,6 +292,7 @@ mod tests {
                     true => Some(ClientConfig::default()),
                     false => None,
                 },
+                api: None,
             };
 
             let args = Cli {

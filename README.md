@@ -7,208 +7,250 @@
 ![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
 [![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
 [![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
-[![Join the chat at https://gitter.im/rapiz1/rathole](https://badges.gitter.im/rapiz1/rathole.svg)](https://gitter.im/rapiz1/rathole?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-
-[English](README.md) | [简体中文](README-zh.md)
 
 A secure, stable and high-performance reverse proxy for NAT traversal, written in Rust
 
 rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
 
-<!-- TOC -->
-
-- [rathole](#rathole)
-  - [Features](#features)
-  - [Quickstart](#quickstart)
-  - [Configuration](#configuration)
-    - [Logging](#logging)
-    - [Tuning](#tuning)
-  - [Benchmark](#benchmark)
-  - [Planning](#planning)
-
-<!-- /TOC -->
-
 ## Features
 
-- **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections. See [Benchmark](#benchmark)
-- **Low Resource Consumption** Consumes much fewer memory than similar tools. See [Benchmark](#benchmark). [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
-- **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
-- **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
+- **High Performance** Much higher throughput than frp, more stable under heavy connections. See [Benchmark](#benchmark)
+- **Low Resource Consumption** Uses far less memory than similar tools. Binary can be **~500KiB** for embedded devices. See [Build Guide](docs/build-guide.md)
+- **Security** Mandatory per-service tokens. Optional Noise Protocol or TLS encryption
+- **Hot Reload** Add/remove services by editing the config file — no restart needed
+- **Runtime API** REST API to add, remove, and inspect services at runtime
+- **Agent Control Channel** Server can push service changes to connected clients automatically
+- **Dynamic Port Binding** New services bind ports on-the-fly without restarting
+- **Service Registry** Track service state (registered, active, disconnected) in real time
 
 ## Quickstart
 
-A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
+### Install
 
-The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
+Download from [releases](https://github.com/rapiz1/rathole/releases), [build from source](docs/build-guide.md), or use [Docker](https://hub.docker.com/r/rapiz1/rathole).
 
-To use `rathole`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.
+### Basic Setup
 
-Assuming you have a NAS at home behind the NAT, and want to expose its ssh service to the Internet:
+You need: a server with a public IP, and a device behind NAT running a service you want to expose.
 
-1. On the server which has a public IP
+**Example:** Expose your home NAS SSH to the Internet.
 
-Create `server.toml` with the following content and accommodate it to your needs.
+#### Step 1 — Server (public IP)
 
 ```toml
 # server.toml
 [server]
-bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
+bind_addr = "0.0.0.0:2333"
 
 [server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to an arbitrary value.
-bind_addr = "0.0.0.0:5202" # `5202` specifies the port that exposes `my_nas_ssh` to the Internet
+token = "use_a_secret_that_only_you_know"
+bind_addr = "0.0.0.0:5202"
 ```
-
-Then run:
 
 ```bash
 ./rathole server.toml
 ```
 
-2. On the host which is behind the NAT (your NAS)
-
-Create `client.toml` with the following content and accommodate it to your needs.
+#### Step 2 — Client (behind NAT)
 
 ```toml
 # client.toml
 [client]
-remote_addr = "myserver.com:2333" # The address of the server. The port must be the same with the port in `server.bind_addr`
+remote_addr = "myserver.com:2333"
 
 [client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Must be the same with the server to pass the validation
-local_addr = "127.0.0.1:22" # The address of the service that needs to be forwarded
+token = "use_a_secret_that_only_you_know"
+local_addr = "127.0.0.1:22"
 ```
-
-Then run:
 
 ```bash
 ./rathole client.toml
 ```
 
-3. Now the client will try to connect to the server `myserver.com` on port `2333`, and any traffic to `myserver.com:5202` will be forwarded to the client's port `22`.
+#### Step 3 — Connect
 
-So you can `ssh myserver.com:5202` to ssh to your NAS.
+```bash
+ssh myserver.com -p 5202
+```
 
-To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+Traffic to `myserver.com:5202` is forwarded to your NAS port `22`.
 
-## Configuration
+## Runtime API
 
-`rathole` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in [Quickstart](#quickstart).
+Enable the REST API to manage services without editing config files or restarting.
 
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `rathole --server config.toml` and on the client side, run `rathole --client config.toml` to explicitly tell `rathole` the running mode.
+### Enable
 
-Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
+Add an `[api]` block to your config:
 
-See [Transport](./docs/transport.md) for more details about encryption and the `transport` block.
+```toml
+[api]
+bind_addr = "127.0.0.1:9090"
+token = "my-api-secret"       # optional, enables bearer token auth
+```
 
-Here is the full configuration specification:
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/services` | List all services with state |
+| `GET` | `/api/v1/services/:name` | Get one service |
+| `PUT` | `/api/v1/services/:name` | Add or update a service |
+| `DELETE` | `/api/v1/services/:name` | Remove a service |
+
+### Examples
+
+**List services:**
+
+```bash
+curl -H "Authorization: Bearer my-api-secret" \
+  http://127.0.0.1:9090/api/v1/services
+```
+
+**Add a server service:**
+
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer my-api-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"bind_addr":"0.0.0.0:5203","token":"secret123"}' \
+  http://127.0.0.1:9090/api/v1/services/new_service
+```
+
+**Add a client service:**
+
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer my-api-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"local_addr":"127.0.0.1:3000","token":"secret123"}' \
+  http://127.0.0.1:9090/api/v1/services/new_service
+```
+
+**Remove a service:**
+
+```bash
+curl -X DELETE \
+  -H "Authorization: Bearer my-api-secret" \
+  http://127.0.0.1:9090/api/v1/services/new_service
+```
+
+Services added via API take effect immediately — ports bind and tunnels establish without restart.
+
+### Agent Control Channel
+
+When a service is added or removed on the server, the change is automatically pushed to all connected clients via the control channel. Clients create or tear down tunnels in response, enabling fully centralized service management from the server side.
+
+## Configuration Reference
+
+`rathole` auto-detects server or client mode based on which block is present. If both exist, use `--server` or `--client` to specify.
+
+See [examples](./examples) and [Transport docs](./docs/transport.md) for more.
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+remote_addr = "example.com:2333"     # Required. Server address
+default_token = "token"              # Optional. Default token for services
+heartbeat_timeout = 40               # Optional. 0 to disable. Default: 40s
+retry_interval = 1                   # Optional. Default: 1s
 
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
+[client.transport]
+type = "tcp"                         # "tcp", "tls", "noise", "websocket"
 
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
+[client.transport.tcp]
+proxy = "socks5://user:pass@127.0.0.1:1080"  # Optional. http or socks5
+nodelay = true                       # Optional. Default: true
+keepalive_secs = 20                  # Optional. Default: 20
+keepalive_interval = 8               # Optional. Default: 8
 
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
+[client.transport.tls]
+trusted_root = "ca.pem"             # Required for tls
+hostname = "example.com"            # Optional
 
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
+[client.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "base64_key"    # Optional
+remote_public_key = "base64_key"    # Optional
 
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
+[client.transport.websocket]
+tls = true                          # Use TLS settings if true
 
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
+[client.services.myservice]
+type = "tcp"                        # "tcp" or "udp". Default: "tcp"
+token = "secret"                    # Required if no default_token
+local_addr = "127.0.0.1:8080"      # Required. Local service address
+nodelay = true                      # Optional
+retry_interval = 1                  # Optional
 
 [server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+bind_addr = "0.0.0.0:2333"         # Required. Listen address
+default_token = "token"             # Optional
+heartbeat_interval = 30             # Optional. 0 to disable. Default: 30s
 
-[server.transport] # Same as `[client.transport]`
+[server.transport]                  # Same options as client.transport
 type = "tcp"
 
-[server.transport.tcp] # Same as the client
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
+[server.transport.tls]
+pkcs12 = "identity.pfx"            # Required for tls
+pkcs12_password = "password"        # Required for tls
 
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
+[server.services.myservice]
+type = "tcp"                        # "tcp" or "udp". Default: "tcp"
+token = "secret"                    # Required if no default_token
+bind_addr = "0.0.0.0:8080"         # Required. Exposed address
+nodelay = true                      # Optional
 
-[server.transport.noise] # Same as `[client.transport.noise]`
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
-
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
-
-[server.services.service2]
-bind_addr = "0.0.0.1:8082"
+[api]                               # Optional. Runtime REST API
+bind_addr = "127.0.0.1:9090"       # Required. API listen address
+token = "api-secret"                # Optional. Bearer token for auth
 ```
 
-### Logging
+## Logging
 
-`rathole`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
+Control log level via `RUST_LOG` environment variable:
 
-```shell
-RUST_LOG=error ./rathole config.toml
+```bash
+RUST_LOG=debug ./rathole config.toml
 ```
 
-will run `rathole` with only error level logging.
+Levels: `error`, `warn`, `info` (default), `debug`, `trace`
 
-If `RUST_LOG` is not present, the default logging level is `info`.
+## Tuning
 
-### Tuning
-
-From v0.4.7, rathole enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
-
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
+TCP_NODELAY is enabled by default for lower latency (good for RDP, game servers, etc.). Set `nodelay = false` if bandwidth matters more than latency.
 
 ## Benchmark
 
-rathole has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
+rathole has similar latency to frp but handles more connections with higher bandwidth and less memory.
 
-For more details, see the separate page [Benchmark](./docs/benchmark.md).
-
-**However, don't take it from here that `rathole` can magically make your forwarded service faster several times than before.** The benchmark is done on local loopback, indicating the performance when the task is cpu-bounded. One can gain quite a improvement if the network is not the bottleneck. Unfortunately, that's not true for many users. In that case, the main benefit is lower resource consumption, while the bandwidth and the latency may not improved significantly.
+See [Benchmark details](./docs/benchmark.md).
 
 ![http_throughput](./docs/img/http_throughput.svg)
 ![tcp_bitrate](./docs/img/tcp_bitrate.svg)
 ![udp_bitrate](./docs/img/udp_bitrate.svg)
 ![mem](./docs/img/mem-graph.png)
 
-## Planning
+## Build Features
 
-- [ ] HTTP APIs for configuration
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `server` | Yes | Server mode |
+| `client` | Yes | Client mode |
+| `native-tls` | Yes | TLS via system library |
+| `rustls` | No | TLS via rustls |
+| `noise` | Yes | Noise protocol encryption |
+| `websocket-native-tls` | Yes | WebSocket transport |
+| `hot-reload` | Yes | Config file watching |
+| `api` | Yes | Runtime REST API |
 
-[Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
+Build with minimal features for embedded:
+
+```bash
+cargo build --release --no-default-features --features server,client,noise,hot-reload
+```
+
+## Systemd
+
+See [systemd examples](./examples/systemd) for running rathole as a background service.
+
+[Out of Scope](./docs/out-of-scope.md) lists features not planned and why.
