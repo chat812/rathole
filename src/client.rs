@@ -213,6 +213,13 @@ impl<T: 'static + Transport> Client<T> {
                             return;
                         }
                     }
+
+                    // Skip if an identical service is already running
+                    if self.service_handles.contains_key(&cfg.name) {
+                        debug!("Service {} already exists, skipping duplicate push", cfg.name);
+                        return;
+                    }
+
                     let name = cfg.name.clone();
                     let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                     let local_addr = cfg.local_addr.clone();
