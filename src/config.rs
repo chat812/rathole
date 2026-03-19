@@ -104,6 +104,10 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    /// Client-side forward address. When set, the server pushes this to clients
+    /// so they know where to forward traffic without needing their own config.
+    #[serde(default)]
+    pub local_addr: Option<String>,
 }
 
 impl ServerServiceConfig {

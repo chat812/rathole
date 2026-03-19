@@ -245,20 +245,20 @@ impl<T: 'static + Transport> Server<T> {
                         .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type)
                         .await;
 
-                    // Push AddService to all connected clients
-                    let push_cfg = ServicePushConfig {
-                        name: cfg.name.clone(),
-                        local_addr: String::new(), // Client must configure this
-                        service_type: cfg.service_type,
-                        token: cfg
-                            .token
-                            .as_ref()
-                            .map(|t| t.to_string())
-                            .unwrap_or_default(),
-                        nodelay: cfg.nodelay,
-                    };
-                    let cmd = ControlChannelCmd::AddService(push_cfg);
-                    {
+                    // Push AddService to all connected clients (only if local_addr is set)
+                    if cfg.local_addr.is_some() {
+                        let push_cfg = ServicePushConfig {
+                            name: cfg.name.clone(),
+                            local_addr: cfg.local_addr.clone().unwrap_or_default(),
+                            service_type: cfg.service_type,
+                            token: cfg
+                                .token
+                                .as_ref()
+                                .map(|t| t.to_string())
+                                .unwrap_or_default(),
+                            nodelay: cfg.nodelay,
+                        };
+                        let cmd = ControlChannelCmd::AddService(push_cfg);
                         let channels = self.control_channels.read().await;
                         for handle in channels.values() {
                             let _ = handle.cmd_tx.send(cmd.clone());
@@ -408,6 +408,29 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             server_config.heartbeat_interval,
             registry,
         );
+
+        // Push all existing services with local_addr to the newly connected client
+        {
+            let svcs = services.read().await;
+            for svc in svcs.values() {
+                if let Some(ref local_addr) = svc.local_addr {
+                    let push_cfg = ServicePushConfig {
+                        name: svc.name.clone(),
+                        local_addr: local_addr.clone(),
+                        service_type: svc.service_type,
+                        token: svc
+                            .token
+                            .as_ref()
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        nodelay: svc.nodelay,
+                    };
+                    let _ = handle
+                        .cmd_tx
+                        .send(ControlChannelCmd::AddService(push_cfg));
+                }
+            }
+        }
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);

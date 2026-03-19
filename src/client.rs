@@ -521,18 +521,22 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         ControlChannelCmd::HeartBeat => (),
                         ControlChannelCmd::AddService(push_cfg) => {
                             info!("Server pushed AddService: {}", push_cfg.name);
-                            let client_cfg = ClientServiceConfig {
-                                name: push_cfg.name.clone(),
-                                local_addr: push_cfg.local_addr,
-                                service_type: push_cfg.service_type,
-                                token: Some(MaskedString::from(push_cfg.token.as_str())),
-                                nodelay: push_cfg.nodelay,
-                                prefer_ipv6: false,
-                                retry_interval: None,
-                            };
-                            let _ = self.push_event_tx.send(
-                                ConfigChange::ClientChange(ClientServiceChange::Add(client_cfg))
-                            );
+                            if push_cfg.local_addr.is_empty() {
+                                warn!("Ignoring pushed service {} with empty local_addr", push_cfg.name);
+                            } else {
+                                let client_cfg = ClientServiceConfig {
+                                    name: push_cfg.name.clone(),
+                                    local_addr: push_cfg.local_addr,
+                                    service_type: push_cfg.service_type,
+                                    token: Some(MaskedString::from(push_cfg.token.as_str())),
+                                    nodelay: push_cfg.nodelay,
+                                    prefer_ipv6: false,
+                                    retry_interval: Some(1), // Default retry interval
+                                };
+                                let _ = self.push_event_tx.send(
+                                    ConfigChange::ClientChange(ClientServiceChange::Add(client_cfg))
+                                );
+                            }
                         },
                         ControlChannelCmd::RemoveService(name) => {
                             info!("Server pushed RemoveService: {}", name);
