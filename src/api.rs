@@ -61,6 +61,7 @@ fn unauthorized() -> Response<Body> {
 struct SetupCode {
     agent_id: String,
     token: String,
+    remote_addr: String,
     created_at: std::time::Instant,
 }
 
@@ -83,8 +84,6 @@ struct ApiState {
     approved_map: ApprovedMap,
     /// One-time setup codes for agent auto-configuration
     setup_codes: SetupCodeMap,
-    /// Server bind_addr for setup responses
-    server_bind_addr: String,
 }
 
 /// Extract the port from a bind address like "0.0.0.0:5022".
@@ -367,11 +366,15 @@ async fn handle_request(
                             let agent_id = v.get("agent_id").and_then(|v| v.as_str());
                             let token = v.get("token").and_then(|v| v.as_str());
                             let setup_code = v.get("setup_code").and_then(|v| v.as_str());
+                            let remote_addr = v.get("remote_addr").and_then(|v| v.as_str());
 
-                            if let (Some(agent_id), Some(token), Some(code)) = (agent_id, token, setup_code) {
+                            if let (Some(agent_id), Some(token), Some(code), Some(remote_addr)) =
+                                (agent_id, token, setup_code, remote_addr)
+                            {
                                 let entry = SetupCode {
                                     agent_id: agent_id.to_string(),
                                     token: token.to_string(),
+                                    remote_addr: remote_addr.to_string(),
                                     created_at: std::time::Instant::now(),
                                 };
                                 state.setup_codes.write().await.insert(code.to_string(), entry);
@@ -380,7 +383,7 @@ async fn handle_request(
                                     &serde_json::json!({"status": "created", "setup_code": code}).to_string(),
                                 )
                             } else {
-                                bad_request("required fields: agent_id, token, setup_code")
+                                bad_request("required fields: agent_id, token, setup_code, remote_addr")
                             }
                         }
                         Err(e) => bad_request(&format!("invalid JSON: {}", e)),
@@ -402,7 +405,7 @@ async fn handle_request(
             match entry {
                 Some(setup) => {
                     ok_json(serde_json::json!({
-                        "remote_addr": state.server_bind_addr,
+                        "remote_addr": setup.remote_addr,
                         "token": setup.token,
                         "agent_id": setup.agent_id,
                     }))
@@ -427,7 +430,6 @@ pub async fn start(
     default_token: Option<MaskedString>,
     pending_map: PendingMap,
     approved_map: ApprovedMap,
-    server_bind_addr: String,
 ) -> Result<()> {
     let addr: SocketAddr = config
         .bind_addr
@@ -449,7 +451,6 @@ pub async fn start(
         pending_map,
         approved_map,
         setup_codes: Arc::new(RwLock::new(HashMap::new())),
-        server_bind_addr,
     });
 
     let listener = TcpListener::bind(addr)

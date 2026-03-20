@@ -72,9 +72,17 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     }
 
     #[cfg(feature = "api")]
-    if let Some(ref server_api_addr) = args.setup {
-        return run_setup(server_api_addr, args.config_path.as_deref()).await;
-    }
+    let args = {
+        let mut args = args;
+        if let Some(ref server_api_addr) = args.setup {
+            let config_path = run_setup(server_api_addr, args.config_path.as_deref()).await?;
+            args.config_path = Some(config_path);
+            args.setup = None;
+            args.client = true;
+            info!("Setup complete. Starting client...");
+        }
+        args
+    };
 
     // Raise `nofile` limit on linux and mac
     fdlimit::raise_fd_limit();
@@ -136,10 +144,6 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                             let api_shutdown = shutdown_tx.subscribe();
                             let api_pending = pending_map.clone();
                             let api_approved = approved_map.clone();
-                            let server_bind_addr = config.server
-                                .as_ref()
-                                .map(|s| s.bind_addr.clone())
-                                .unwrap_or_default();
                             tokio::spawn(async move {
                                 if let Err(e) = api::start(
                                     api_cfg,
@@ -150,7 +154,6 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                     default_token,
                                     api_pending,
                                     api_approved,
-                                    server_bind_addr,
                                 ).await {
                                     error!("API server error: {:#}", e);
                                 }
@@ -257,7 +260,7 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
 
 /// First-run setup: prompt for a setup code, fetch config from server, write config file.
 #[cfg(feature = "api")]
-async fn run_setup(server_api_addr: &str, config_path: Option<&std::path::Path>) -> Result<()> {
+async fn run_setup(server_api_addr: &str, config_path: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
     use anyhow::Context;
     use std::io::{self, Write};
 
@@ -312,10 +315,9 @@ async fn run_setup(server_api_addr: &str, config_path: Option<&std::path::Path>)
     std::fs::write(&config_path, &config_content)
         .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
 
-    info!("Config written to {}. You can now start normally with:", config_path.display());
-    info!("  rathole {}", config_path.display());
+    info!("Config written to {}", config_path.display());
 
-    Ok(())
+    Ok(config_path)
 }
 
 #[cfg(test)]
