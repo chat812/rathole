@@ -1,13 +1,15 @@
-use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig};
+use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig, ServiceType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
 use crate::pending::{self, ApprovedMap, PendingMap};
+use crate::protocol;
 use crate::registry::ServiceRegistry;
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info};
 
 use hyper::body::Incoming;
@@ -55,6 +57,16 @@ fn unauthorized() -> Response<Body> {
     )
 }
 
+/// A one-time setup code for agent auto-configuration.
+struct SetupCode {
+    agent_id: String,
+    token: String,
+    created_at: std::time::Instant,
+}
+
+/// Map of setup_code -> SetupCode, shared and expirable.
+type SetupCodeMap = Arc<RwLock<HashMap<String, SetupCode>>>;
+
 /// Shared state for the API request handler.
 struct ApiState {
     event_tx: mpsc::UnboundedSender<ConfigChange>,
@@ -69,6 +81,10 @@ struct ApiState {
     pending_map: PendingMap,
     /// Approved IPs per service
     approved_map: ApprovedMap,
+    /// One-time setup codes for agent auto-configuration
+    setup_codes: SetupCodeMap,
+    /// Server bind_addr for setup responses
+    server_bind_addr: String,
 }
 
 /// Extract the port from a bind address like "0.0.0.0:5022".
@@ -109,13 +125,19 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<ApiState>,
 ) -> Result<Response<Body>, Infallible> {
-    if !check_auth(&req, &state.token) {
-        return Ok(unauthorized());
-    }
-
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let segments = path_segments(&path);
+
+    // Allow unauthenticated access to setup code claim endpoint
+    let is_setup_claim = matches!(
+        (method.clone(), segments.as_slice()),
+        (Method::GET, ["api", "v1", "setup", _])
+    );
+
+    if !is_setup_claim && !check_auth(&req, &state.token) {
+        return Ok(unauthorized());
+    }
 
     let response = match (method, segments.as_slice()) {
         // GET /api/v1/services - list all services
@@ -262,6 +284,133 @@ async fn handle_request(
             }
         }
 
+        // PUT /api/v1/agents/:agent_id - register an agent (creates gateway service)
+        (Method::PUT, ["api", "v1", "agents", agent_id]) => {
+            let agent_id = agent_id.to_string();
+            let gw_name = protocol::agent_gateway_name(&agent_id);
+
+            // Parse optional token from body
+            let agent_token = match read_body(req).await {
+                Ok(body) if !body.is_empty() => {
+                    serde_json::from_slice::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("token").and_then(|t| t.as_str().map(String::from)))
+                }
+                _ => None,
+            };
+
+            let token = agent_token
+                .map(|t| MaskedString::from(t.as_str()))
+                .or_else(|| state.default_token.clone());
+
+            if token.is_none() {
+                return Ok(bad_request("token is required (in body or configure default_token)"));
+            }
+
+            let cfg = ServerServiceConfig {
+                service_type: ServiceType::Tcp,
+                name: gw_name.clone(),
+                bind_addr: String::new(),
+                token,
+                nodelay: None,
+                local_addr: None,
+                require_approval: false,
+                agent_id: Some(agent_id.clone()),
+            };
+
+            let _ = state.event_tx.send(ConfigChange::ServerChange(
+                ServerServiceChange::Add(cfg),
+            ));
+            state.registry.register(gw_name, String::new(), "gateway".to_string()).await;
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"status": "registered", "agent_id": agent_id}).to_string(),
+            )
+        }
+
+        // DELETE /api/v1/agents/:agent_id - unregister agent + delete owned services
+        (Method::DELETE, ["api", "v1", "agents", agent_id]) => {
+            let agent_id = agent_id.to_string();
+            let gw_name = protocol::agent_gateway_name(&agent_id);
+
+            // Remove the gateway service
+            let _ = state.event_tx.send(ConfigChange::ServerChange(
+                ServerServiceChange::Delete(gw_name.clone()),
+            ));
+            state.registry.unregister(&gw_name).await;
+
+            // Note: The controller should delete owned services individually before unregistering.
+            // The registry doesn't store agent_id, so we can't filter here.
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"status": "unregistered", "agent_id": agent_id}).to_string(),
+            )
+        }
+
+        // GET /api/v1/agents - list agent gateway services
+        (Method::GET, ["api", "v1", "agents"]) => {
+            let all = state.registry.list().await;
+            let agents: Vec<_> = all.into_iter()
+                .filter(|s| protocol::is_gateway_service(&s.name) && s.name != protocol::GATEWAY_SERVICE_NAME)
+                .collect();
+            ok_json(agents)
+        }
+
+        // POST /api/v1/setup - create a setup code
+        (Method::POST, ["api", "v1", "setup"]) => {
+            match read_body(req).await {
+                Ok(body) => {
+                    match serde_json::from_slice::<serde_json::Value>(&body) {
+                        Ok(v) => {
+                            let agent_id = v.get("agent_id").and_then(|v| v.as_str());
+                            let token = v.get("token").and_then(|v| v.as_str());
+                            let setup_code = v.get("setup_code").and_then(|v| v.as_str());
+
+                            if let (Some(agent_id), Some(token), Some(code)) = (agent_id, token, setup_code) {
+                                let entry = SetupCode {
+                                    agent_id: agent_id.to_string(),
+                                    token: token.to_string(),
+                                    created_at: std::time::Instant::now(),
+                                };
+                                state.setup_codes.write().await.insert(code.to_string(), entry);
+                                json_response(
+                                    StatusCode::OK,
+                                    &serde_json::json!({"status": "created", "setup_code": code}).to_string(),
+                                )
+                            } else {
+                                bad_request("required fields: agent_id, token, setup_code")
+                            }
+                        }
+                        Err(e) => bad_request(&format!("invalid JSON: {}", e)),
+                    }
+                }
+                Err(e) => bad_request(&format!("failed to read body: {}", e)),
+            }
+        }
+
+        // GET /api/v1/setup/:code - claim a setup code (no auth required)
+        (Method::GET, ["api", "v1", "setup", code]) => {
+            // Cleanup expired codes (>10 min)
+            {
+                let mut codes = state.setup_codes.write().await;
+                codes.retain(|_, v| v.created_at.elapsed().as_secs() < 600);
+            }
+
+            let entry = state.setup_codes.write().await.remove(*code);
+            match entry {
+                Some(setup) => {
+                    ok_json(serde_json::json!({
+                        "remote_addr": state.server_bind_addr,
+                        "token": setup.token,
+                        "agent_id": setup.agent_id,
+                    }))
+                }
+                None => not_found(),
+            }
+        }
+
         _ => not_found(),
     };
 
@@ -278,6 +427,7 @@ pub async fn start(
     default_token: Option<MaskedString>,
     pending_map: PendingMap,
     approved_map: ApprovedMap,
+    server_bind_addr: String,
 ) -> Result<()> {
     let addr: SocketAddr = config
         .bind_addr
@@ -298,6 +448,8 @@ pub async fn start(
         port_range,
         pending_map,
         approved_map,
+        setup_codes: Arc::new(RwLock::new(HashMap::new())),
+        server_bind_addr,
     });
 
     let listener = TcpListener::bind(addr)

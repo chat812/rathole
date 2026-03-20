@@ -42,7 +42,7 @@ cargo Features:      {}
 #[clap(group(
             ArgGroup::new("cmds")
                 .required(true)
-                .args(&["CONFIG", "genkey"]),
+                .args(&["CONFIG", "genkey", "setup"]),
         ))]
 pub struct Cli {
     /// The path to the configuration file
@@ -65,4 +65,9 @@ pub struct Cli {
     /// The DH function to use is x25519
     #[clap(long, arg_enum, value_name = "CURVE")]
     pub genkey: Option<Option<KeypairType>>,
+
+    /// First-run setup: fetch config from server using a one-time setup code.
+    /// Provide the server API address (e.g. "1.2.3.4:9090").
+    #[clap(long, value_name = "SERVER_API_ADDR")]
+    pub setup: Option<String>,
 }

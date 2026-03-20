@@ -111,6 +111,10 @@ pub struct ServerServiceConfig {
     /// Whether incoming visitor connections require approval before forwarding.
     #[serde(default)]
     pub require_approval: bool,
+    /// Agent that owns this service. When set, the service is only pushed
+    /// to the gateway channel of this agent.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 impl ServerServiceConfig {
@@ -223,6 +227,10 @@ pub struct ClientConfig {
     /// all tunnel configs from the server. Defaults to true when services is empty.
     #[serde(default)]
     pub gateway: Option<bool>,
+    /// Agent identifier for per-agent gateway mode.
+    /// When set with gateway=true, connects as __gw_{agent_id}__ instead of __gateway__.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {

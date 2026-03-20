@@ -122,6 +122,20 @@ struct Server<T: Transport> {
     approval_timeout: u64,
 }
 
+/// Determine whether a service should be pushed to a gateway channel.
+/// - Service with agent_id pushes only to the matching agent's gateway.
+/// - Service without agent_id (legacy) pushes to ALL gateways.
+fn should_push_to_gateway(
+    svc_agent_id: &Option<String>,
+    handle_agent_id: &Option<String>,
+) -> bool {
+    match (svc_agent_id, handle_agent_id) {
+        (Some(svc), Some(handle)) => svc == handle,
+        (None, _) => true, // Legacy service → push to all gateways
+        (Some(_), None) => false, // Agent-owned service → don't push to legacy gateway
+    }
+}
+
 // Generate a hash map of services which is indexed by ServiceDigest
 fn generate_service_hashmap(
     server_config: &ServerConfig,
@@ -164,6 +178,7 @@ impl<T: 'static + Transport> Server<T> {
                 nodelay: None,
                 local_addr: None,
                 require_approval: false,
+                agent_id: None,
             };
             services_map.insert(protocol::gateway_digest(), gateway_cfg);
         }
@@ -303,6 +318,7 @@ impl<T: 'static + Transport> Server<T> {
                     };
 
                     let hash = protocol::digest(cfg.name.as_bytes());
+                    let svc_agent_id = cfg.agent_id.clone();
 
                     // Insert into services map first so clients can authenticate when they connect back
                     {
@@ -310,14 +326,15 @@ impl<T: 'static + Transport> Server<T> {
                         let _ = wg.insert(hash, cfg);
                     }
 
-                    // Push AddService to gateway clients only — service-specific channels
-                    // must not receive pushes or they loop (they'd drop and reconnect for
-                    // the same service, which triggers another push, ad infinitum)
+                    // Push AddService to matching gateway clients only
                     let cmd = ControlChannelCmd::AddService(push_cfg);
                     {
                         let channels = self.control_channels.read().await;
                         for handle in channels.values() {
-                            if handle.service.name == GATEWAY_SERVICE_NAME {
+                            if !protocol::is_gateway_service(&handle.service.name) {
+                                continue;
+                            }
+                            if should_push_to_gateway(&svc_agent_id, &handle.agent_id) {
                                 let _ = handle.cmd_tx.send(cmd.clone());
                             }
                         }
@@ -332,18 +349,25 @@ impl<T: 'static + Transport> Server<T> {
                     // Clear approved IPs for this service
                     pending::clear_approved(&self.approved_map, &s).await;
 
-                    // Push RemoveService to gateway clients only
+                    // Look up agent_id before removing
+                    let hash = protocol::digest(s.as_bytes());
+                    let svc_agent_id = self.services.read().await.get(&hash)
+                        .and_then(|svc| svc.agent_id.clone());
+
+                    // Push RemoveService to matching gateway clients only
                     let cmd = ControlChannelCmd::RemoveService(s.clone());
                     {
                         let channels = self.control_channels.read().await;
                         for handle in channels.values() {
-                            if handle.service.name == GATEWAY_SERVICE_NAME {
+                            if !protocol::is_gateway_service(&handle.service.name) {
+                                continue;
+                            }
+                            if should_push_to_gateway(&svc_agent_id, &handle.agent_id) {
                                 let _ = handle.cmd_tx.send(cmd.clone());
                             }
                         }
                     }
 
-                    let hash = protocol::digest(s.as_bytes());
                     let _ = self.services.write().await.remove(&hash);
 
                     let mut wg = self.control_channels.write().await;
@@ -484,13 +508,15 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             approval_timeout,
         );
 
-        // Push all existing services to a newly connected GATEWAY client only.
-        // Service-specific channels must not receive pushes — they would loop
-        // by dropping and reconnecting for the same service.
-        if handle.service.name == GATEWAY_SERVICE_NAME {
+        // Push existing services to a newly connected GATEWAY client.
+        // Only push services that belong to this agent (or legacy unowned services).
+        if protocol::is_gateway_service(&handle.service.name) {
             let svcs = services.read().await;
             for svc in svcs.values() {
-                if svc.name == GATEWAY_SERVICE_NAME {
+                if protocol::is_gateway_service(&svc.name) {
+                    continue;
+                }
+                if !should_push_to_gateway(&svc.agent_id, &handle.agent_id) {
                     continue;
                 }
                 let push_cfg = ServicePushConfig {
@@ -555,6 +581,8 @@ pub struct ControlChannelHandle<T: Transport> {
     _registry_guard: RegistryGuard,
     // Keep the data channel request sender alive (gateway channels have no pool to hold it)
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    // Agent ID for per-agent gateways (None for legacy __gateway__ or non-gateway services)
+    agent_id: Option<String>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -671,6 +699,8 @@ where
             .instrument(Span::current()),
         );
 
+        let agent_id = protocol::extract_agent_id(&service.name);
+
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
@@ -678,6 +708,7 @@ where
             cmd_tx,
             _data_ch_req_tx: data_ch_req_tx,
             _registry_guard: registry_guard,
+            agent_id,
         }
     }
 }

@@ -71,6 +71,11 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
         return genkey(args.genkey.unwrap());
     }
 
+    #[cfg(feature = "api")]
+    if let Some(ref server_api_addr) = args.setup {
+        return run_setup(server_api_addr, args.config_path.as_deref()).await;
+    }
+
     // Raise `nofile` limit on linux and mac
     fdlimit::raise_fd_limit();
 
@@ -131,6 +136,10 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                             let api_shutdown = shutdown_tx.subscribe();
                             let api_pending = pending_map.clone();
                             let api_approved = approved_map.clone();
+                            let server_bind_addr = config.server
+                                .as_ref()
+                                .map(|s| s.bind_addr.clone())
+                                .unwrap_or_default();
                             tokio::spawn(async move {
                                 if let Err(e) = api::start(
                                     api_cfg,
@@ -141,6 +150,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                     default_token,
                                     api_pending,
                                     api_approved,
+                                    server_bind_addr,
                                 ).await {
                                     error!("API server error: {:#}", e);
                                 }
@@ -243,6 +253,69 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
     } else {
         Undetermine
     }
+}
+
+/// First-run setup: prompt for a setup code, fetch config from server, write config file.
+#[cfg(feature = "api")]
+async fn run_setup(server_api_addr: &str, config_path: Option<&std::path::Path>) -> Result<()> {
+    use anyhow::Context;
+    use std::io::{self, Write};
+
+    let config_path = config_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("client.toml"));
+
+    if config_path.exists() {
+        anyhow::bail!(
+            "Config file '{}' already exists. Delete it first to re-run setup.",
+            config_path.display()
+        );
+    }
+
+    print!("Enter setup code: ");
+    io::stdout().flush()?;
+    let mut code = String::new();
+    io::stdin().read_line(&mut code)?;
+    let code = code.trim();
+
+    if code.is_empty() {
+        anyhow::bail!("Setup code cannot be empty");
+    }
+
+    let url = format!("http://{}/api/v1/setup/{}", server_api_addr, code);
+    info!("Fetching config from {}...", url);
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to {}", server_api_addr))?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Setup code invalid or expired (server returned {})", resp.status());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let remote_addr = body["remote_addr"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing remote_addr in response"))?;
+    let token = body["token"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing token in response"))?;
+    let agent_id = body["agent_id"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing agent_id in response"))?;
+
+    let config_content = format!(
+        "[client]\nremote_addr = \"{}\"\ndefault_token = \"{}\"\nagent_id = \"{}\"\n",
+        remote_addr, token, agent_id
+    );
+
+    std::fs::write(&config_path, &config_content)
+        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+
+    info!("Config written to {}. You can now start normally with:", config_path.display());
+    info!("  rathole {}", config_path.display());
+
+    Ok(())
 }
 
 #[cfg(test)]

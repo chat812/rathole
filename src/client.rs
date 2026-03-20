@@ -139,9 +139,13 @@ impl<T: 'static + Transport> Client<T> {
         // In gateway mode, open a single gateway control channel
         // that receives all tunnel configs from the server
         if self.config.gateway == Some(true) {
-            info!("Starting in gateway mode — waiting for server to push tunnels");
+            let gw_name = match &self.config.agent_id {
+                Some(id) => protocol::agent_gateway_name(id),
+                None => GATEWAY_SERVICE_NAME.to_string(),
+            };
+            info!("Starting in gateway mode (service: {}) — waiting for server to push tunnels", gw_name);
             let gateway_cfg = ClientServiceConfig {
-                name: GATEWAY_SERVICE_NAME.to_string(),
+                name: gw_name.clone(),
                 local_addr: String::new(), // Not used for the gateway channel itself
                 service_type: ServiceType::Tcp,
                 token: self.config.default_token.clone(),
@@ -157,7 +161,7 @@ impl<T: 'static + Transport> Client<T> {
                 push_event_tx.clone(),
             );
             self.service_handles
-                .insert(GATEWAY_SERVICE_NAME.to_string(), handle);
+                .insert(gw_name, handle);
         }
 
         for (name, config) in &self.config.services {

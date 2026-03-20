@@ -164,9 +164,36 @@ pub fn digest(data: &[u8]) -> Digest {
 /// without needing any pre-configured services.
 pub const GATEWAY_SERVICE_NAME: &str = "__gateway__";
 
+/// Prefix/suffix for per-agent gateway service names: `__gw_<agent_id>__`
+pub const GATEWAY_PREFIX: &str = "__gw_";
+pub const GATEWAY_SUFFIX: &str = "__";
+
 /// Returns the digest for the gateway service.
 pub fn gateway_digest() -> Digest {
     digest(GATEWAY_SERVICE_NAME.as_bytes())
+}
+
+/// Check if a service name is any kind of gateway (legacy or per-agent).
+pub fn is_gateway_service(name: &str) -> bool {
+    name == GATEWAY_SERVICE_NAME
+        || (name.starts_with(GATEWAY_PREFIX) && name.ends_with(GATEWAY_SUFFIX))
+}
+
+/// Extract agent_id from a per-agent gateway name like `__gw_abc123__`.
+/// Returns None for legacy `__gateway__` or non-gateway names.
+pub fn extract_agent_id(name: &str) -> Option<String> {
+    if name.starts_with(GATEWAY_PREFIX) && name.ends_with(GATEWAY_SUFFIX) {
+        let inner = &name[GATEWAY_PREFIX.len()..name.len() - GATEWAY_SUFFIX.len()];
+        if !inner.is_empty() {
+            return Some(inner.to_string());
+        }
+    }
+    None
+}
+
+/// Build a per-agent gateway service name.
+pub fn agent_gateway_name(agent_id: &str) -> String {
+    format!("{}{}{}", GATEWAY_PREFIX, agent_id, GATEWAY_SUFFIX)
 }
 
 #[allow(dead_code)]
