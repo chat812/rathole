@@ -115,7 +115,7 @@ impl<T: 'static + Transport> Client<T> {
         for (name, svc) in &config.services {
             let svc_type = format!("{:?}", svc.service_type).to_lowercase();
             registry
-                .register(name.clone(), svc.local_addr.clone(), svc_type)
+                .register(name.clone(), svc.local_addr.clone(), svc_type, None)
                 .await;
         }
 
@@ -241,7 +241,7 @@ impl<T: 'static + Transport> Client<T> {
                     let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                     let local_addr = cfg.local_addr.clone();
                     self.registry
-                        .register(name.clone(), local_addr, svc_type)
+                        .register(name.clone(), local_addr, svc_type, None)
                         .await;
 
                     let handle = ControlChannelHandle::new(

@@ -68,6 +68,20 @@ struct SetupCode {
 /// Map of setup_code -> SetupCode, shared and expirable.
 type SetupCodeMap = Arc<RwLock<HashMap<String, SetupCode>>>;
 
+/// Map of agent_token -> agent_id, for per-agent authorization.
+type AgentTokenMap = Arc<RwLock<HashMap<String, String>>>;
+
+/// Authentication level for API requests.
+#[derive(Debug, Clone)]
+enum AuthLevel {
+    /// Full admin access (matches the global API token)
+    Admin,
+    /// Agent-scoped access (can only see/manage own resources)
+    Agent(String), // agent_id
+    /// No valid credentials
+    Unauthorized,
+}
+
 /// Shared state for the API request handler.
 struct ApiState {
     event_tx: mpsc::UnboundedSender<ConfigChange>,
@@ -84,6 +98,8 @@ struct ApiState {
     approved_map: ApprovedMap,
     /// One-time setup codes for agent auto-configuration
     setup_codes: SetupCodeMap,
+    /// Per-agent API tokens (agent_token -> agent_id)
+    agent_tokens: AgentTokenMap,
 }
 
 /// Extract the port from a bind address like "0.0.0.0:5022".
@@ -103,21 +119,41 @@ fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-/// Check bearer token authorization.
-fn check_auth(req: &Request<Incoming>, expected_token: &Option<String>) -> bool {
-    match expected_token {
-        None => true,
-        Some(token) => req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.strip_prefix("Bearer ")
-                    .map(|t| t == token)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false),
+/// Extract bearer token from request.
+fn extract_bearer(req: &Request<Incoming>) -> Option<&str> {
+    req.headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Determine the authentication level for a request.
+async fn check_auth(req: &Request<Incoming>, state: &ApiState) -> AuthLevel {
+    let bearer = match extract_bearer(req) {
+        Some(b) => b,
+        None => {
+            // No token required = admin access for everyone
+            if state.token.is_none() {
+                return AuthLevel::Admin;
+            }
+            return AuthLevel::Unauthorized;
+        }
+    };
+
+    // Check admin token first
+    if let Some(ref admin_token) = state.token {
+        if bearer == admin_token {
+            return AuthLevel::Admin;
+        }
     }
+
+    // Check agent tokens
+    let agent_tokens = state.agent_tokens.read().await;
+    if let Some(agent_id) = agent_tokens.get(bearer) {
+        return AuthLevel::Agent(agent_id.clone());
+    }
+
+    AuthLevel::Unauthorized
 }
 
 async fn handle_request(
@@ -134,7 +170,13 @@ async fn handle_request(
         (Method::GET, ["api", "v1", "setup", _])
     );
 
-    if !is_setup_claim && !check_auth(&req, &state.token) {
+    let auth = if is_setup_claim {
+        AuthLevel::Admin // setup claim uses the code itself as auth
+    } else {
+        check_auth(&req, &state).await
+    };
+
+    if matches!(auth, AuthLevel::Unauthorized) {
         return Ok(unauthorized());
     }
 
@@ -142,13 +184,29 @@ async fn handle_request(
         // GET /api/v1/services - list all services
         (Method::GET, ["api", "v1", "services"]) => {
             let services = state.registry.list().await;
-            ok_json(services)
+            match &auth {
+                AuthLevel::Admin => ok_json(services),
+                AuthLevel::Agent(agent_id) => {
+                    let filtered: Vec<_> = services.into_iter()
+                        .filter(|s| s.agent_id.as_deref() == Some(agent_id.as_str()))
+                        .collect();
+                    ok_json(filtered)
+                }
+                _ => unreachable!(),
+            }
         }
 
         // GET /api/v1/services/:name - get one service
         (Method::GET, ["api", "v1", "services", name]) => {
             match state.registry.get(name).await {
-                Some(info) => ok_json(info),
+                Some(info) => {
+                    if let AuthLevel::Agent(ref agent_id) = auth {
+                        if info.agent_id.as_deref() != Some(agent_id.as_str()) {
+                            return Ok(not_found());
+                        }
+                    }
+                    ok_json(info)
+                }
                 None => not_found(),
             }
         }
@@ -162,6 +220,10 @@ async fn handle_request(
                         match serde_json::from_slice::<ServerServiceConfig>(&body) {
                             Ok(mut cfg) => {
                                 cfg.name = name.clone();
+                                // Agent-scoped: force agent_id to match the token's agent
+                                if let AuthLevel::Agent(ref agent_id) = auth {
+                                    cfg.agent_id = Some(agent_id.clone());
+                                }
                                 // Auto-fill token from default_token if not provided
                                 if cfg.token.is_none() {
                                     cfg.token = state.default_token.clone();
@@ -185,6 +247,7 @@ async fn handle_request(
                                 }
                                 let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                                 let bind_addr = cfg.bind_addr.clone();
+                                let agent_id = cfg.agent_id.clone();
                                 let _ = state
                                     .event_tx
                                     .send(ConfigChange::ServerChange(ServerServiceChange::Add(
@@ -192,7 +255,7 @@ async fn handle_request(
                                     )));
                                 state
                                     .registry
-                                    .register(name, bind_addr, svc_type)
+                                    .register(name, bind_addr, svc_type, agent_id)
                                     .await;
                                 json_response(
                                     StatusCode::OK,
@@ -217,7 +280,7 @@ async fn handle_request(
                                     )));
                                 state
                                     .registry
-                                    .register(name, local_addr, svc_type)
+                                    .register(name, local_addr, svc_type, None)
                                     .await;
                                 json_response(
                                     StatusCode::OK,
@@ -235,6 +298,13 @@ async fn handle_request(
         // DELETE /api/v1/services/:name - remove a service
         (Method::DELETE, ["api", "v1", "services", name]) => {
             let name = name.to_string();
+            // Agent-scoped: verify ownership before deleting
+            if let AuthLevel::Agent(ref agent_id) = auth {
+                match state.registry.get(&name).await {
+                    Some(info) if info.agent_id.as_deref() == Some(agent_id.as_str()) => {}
+                    _ => return Ok(unauthorized()),
+                }
+            }
             if state.is_server {
                 let _ = state
                     .event_tx
@@ -258,11 +328,41 @@ async fn handle_request(
         // GET /api/v1/pending - list pending connections
         (Method::GET, ["api", "v1", "pending"]) => {
             let pending = pending::list(&state.pending_map).await;
-            ok_json(pending)
+            match &auth {
+                AuthLevel::Admin => ok_json(pending),
+                AuthLevel::Agent(agent_id) => {
+                    let mut filtered = Vec::new();
+                    for p in pending {
+                        if let Some(info) = state.registry.get(&p.service_name).await {
+                            if info.agent_id.as_deref() == Some(agent_id.as_str()) {
+                                filtered.push(p);
+                            }
+                        }
+                    }
+                    ok_json(filtered)
+                }
+                _ => unreachable!(),
+            }
         }
 
         // POST /api/v1/pending/:id/approve - approve a pending connection
         (Method::POST, ["api", "v1", "pending", id, "approve"]) => {
+            // Agent-scoped: verify the pending connection belongs to this agent
+            if let AuthLevel::Agent(ref agent_id) = auth {
+                let pending = pending::list(&state.pending_map).await;
+                let mut owns = false;
+                for p in &pending {
+                    if p.id == *id {
+                        if let Some(info) = state.registry.get(&p.service_name).await {
+                            owns = info.agent_id.as_deref() == Some(agent_id.as_str());
+                        }
+                        break;
+                    }
+                }
+                if !owns {
+                    return Ok(unauthorized());
+                }
+            }
             match pending::approve(&state.pending_map, &state.approved_map, id).await {
                 Ok(()) => json_response(
                     StatusCode::OK,
@@ -274,6 +374,22 @@ async fn handle_request(
 
         // POST /api/v1/pending/:id/deny - deny a pending connection
         (Method::POST, ["api", "v1", "pending", id, "deny"]) => {
+            // Agent-scoped: verify the pending connection belongs to this agent
+            if let AuthLevel::Agent(ref agent_id) = auth {
+                let pending = pending::list(&state.pending_map).await;
+                let mut owns = false;
+                for p in &pending {
+                    if p.id == *id {
+                        if let Some(info) = state.registry.get(&p.service_name).await {
+                            owns = info.agent_id.as_deref() == Some(agent_id.as_str());
+                        }
+                        break;
+                    }
+                }
+                if !owns {
+                    return Ok(unauthorized());
+                }
+            }
             match pending::deny(&state.pending_map, id).await {
                 Ok(()) => json_response(
                     StatusCode::OK,
@@ -283,12 +399,15 @@ async fn handle_request(
             }
         }
 
-        // PUT /api/v1/agents/:agent_id - register an agent (creates gateway service)
+        // PUT /api/v1/agents/:agent_id - register an agent (admin only)
         (Method::PUT, ["api", "v1", "agents", agent_id]) => {
+            if !matches!(auth, AuthLevel::Admin) {
+                return Ok(unauthorized());
+            }
             let agent_id = agent_id.to_string();
             let gw_name = protocol::agent_gateway_name(&agent_id);
 
-            // Parse optional token from body
+            // Parse token from body (required — this becomes the agent's API token too)
             let agent_token = match read_body(req).await {
                 Ok(body) if !body.is_empty() => {
                     serde_json::from_slice::<serde_json::Value>(&body)
@@ -298,13 +417,17 @@ async fn handle_request(
                 _ => None,
             };
 
-            let token = agent_token
-                .map(|t| MaskedString::from(t.as_str()))
-                .or_else(|| state.default_token.clone());
+            let token_str = match agent_token {
+                Some(t) => t,
+                None => {
+                    return Ok(bad_request("token is required in body"));
+                }
+            };
 
-            if token.is_none() {
-                return Ok(bad_request("token is required (in body or configure default_token)"));
-            }
+            // Store the agent token for API authorization
+            state.agent_tokens.write().await.insert(token_str.clone(), agent_id.clone());
+
+            let token = Some(MaskedString::from(token_str.as_str()));
 
             let cfg = ServerServiceConfig {
                 service_type: ServiceType::Tcp,
@@ -320,7 +443,7 @@ async fn handle_request(
             let _ = state.event_tx.send(ConfigChange::ServerChange(
                 ServerServiceChange::Add(cfg),
             ));
-            state.registry.register(gw_name, String::new(), "gateway".to_string()).await;
+            state.registry.register(gw_name, String::new(), "gateway".to_string(), Some(agent_id.clone())).await;
 
             json_response(
                 StatusCode::OK,
@@ -328,8 +451,11 @@ async fn handle_request(
             )
         }
 
-        // DELETE /api/v1/agents/:agent_id - unregister agent + delete owned services
+        // DELETE /api/v1/agents/:agent_id - unregister agent + delete owned services (admin only)
         (Method::DELETE, ["api", "v1", "agents", agent_id]) => {
+            if !matches!(auth, AuthLevel::Admin) {
+                return Ok(unauthorized());
+            }
             let agent_id = agent_id.to_string();
             let gw_name = protocol::agent_gateway_name(&agent_id);
 
@@ -339,8 +465,19 @@ async fn handle_request(
             ));
             state.registry.unregister(&gw_name).await;
 
-            // Note: The controller should delete owned services individually before unregistering.
-            // The registry doesn't store agent_id, so we can't filter here.
+            // Remove agent token
+            state.agent_tokens.write().await.retain(|_, v| v != &agent_id);
+
+            // Remove all services owned by this agent
+            let all_services = state.registry.list().await;
+            for svc in all_services {
+                if svc.agent_id.as_deref() == Some(agent_id.as_str()) {
+                    let _ = state.event_tx.send(ConfigChange::ServerChange(
+                        ServerServiceChange::Delete(svc.name.clone()),
+                    ));
+                    state.registry.unregister(&svc.name).await;
+                }
+            }
 
             json_response(
                 StatusCode::OK,
@@ -348,8 +485,11 @@ async fn handle_request(
             )
         }
 
-        // GET /api/v1/agents - list agent gateway services
+        // GET /api/v1/agents - list agent gateway services (admin only)
         (Method::GET, ["api", "v1", "agents"]) => {
+            if !matches!(auth, AuthLevel::Admin) {
+                return Ok(unauthorized());
+            }
             let all = state.registry.list().await;
             let agents: Vec<_> = all.into_iter()
                 .filter(|s| protocol::is_gateway_service(&s.name) && s.name != protocol::GATEWAY_SERVICE_NAME)
@@ -357,8 +497,11 @@ async fn handle_request(
             ok_json(agents)
         }
 
-        // POST /api/v1/setup - create a setup code
+        // POST /api/v1/setup - create a setup code (admin only)
         (Method::POST, ["api", "v1", "setup"]) => {
+            if !matches!(auth, AuthLevel::Admin) {
+                return Ok(unauthorized());
+            }
             match read_body(req).await {
                 Ok(body) => {
                     match serde_json::from_slice::<serde_json::Value>(&body) {
@@ -451,6 +594,7 @@ pub async fn start(
         pending_map,
         approved_map,
         setup_codes: Arc::new(RwLock::new(HashMap::new())),
+        agent_tokens: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let listener = TcpListener::bind(addr)

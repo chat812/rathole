@@ -20,6 +20,8 @@ pub struct ServiceInfo {
     pub bind_addr: String,
     pub service_type: String,
     pub state: ServiceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     #[serde(skip)]
     pub connected_since: Option<Instant>,
     #[serde(skip)]
@@ -39,7 +41,7 @@ impl ServiceRegistry {
     }
 
     /// Register a service as known but not yet connected.
-    pub async fn register(&self, name: String, bind_addr: String, service_type: String) {
+    pub async fn register(&self, name: String, bind_addr: String, service_type: String, agent_id: Option<String>) {
         let mut map = self.services.write().await;
         map.insert(
             name.clone(),
@@ -48,6 +50,7 @@ impl ServiceRegistry {
                 bind_addr,
                 service_type,
                 state: ServiceState::Registered,
+                agent_id,
                 connected_since: None,
                 last_heartbeat: None,
             },

@@ -161,7 +161,7 @@ impl<T: 'static + Transport> Server<T> {
         for (name, svc) in &config.services {
             let svc_type = format!("{:?}", svc.service_type).to_lowercase();
             registry
-                .register(name.clone(), svc.bind_addr.clone(), svc_type)
+                .register(name.clone(), svc.bind_addr.clone(), svc_type, svc.agent_id.clone())
                 .await;
         }
 
@@ -301,7 +301,7 @@ impl<T: 'static + Transport> Server<T> {
                 ServerServiceChange::Add(cfg) => {
                     let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
                     self.registry
-                        .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type)
+                        .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type, cfg.agent_id.clone())
                         .await;
 
                     // Build push config before moving cfg into the services map
