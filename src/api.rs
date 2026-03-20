@@ -1,5 +1,6 @@
 use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig};
 use crate::config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
+use crate::pending::{self, PendingMap};
 use crate::registry::ServiceRegistry;
 
 use anyhow::{Context, Result};
@@ -64,6 +65,8 @@ struct ApiState {
     default_token: Option<MaskedString>,
     /// Allowed port range for tunnel bind_addr
     port_range: Option<(u16, u16)>,
+    /// Shared pending connections map
+    pending_map: PendingMap,
 }
 
 /// Extract the port from a bind address like "0.0.0.0:5022".
@@ -229,6 +232,34 @@ async fn handle_request(
             )
         }
 
+        // GET /api/v1/pending - list pending connections
+        (Method::GET, ["api", "v1", "pending"]) => {
+            let pending = pending::list(&state.pending_map).await;
+            ok_json(pending)
+        }
+
+        // POST /api/v1/pending/:id/approve - approve a pending connection
+        (Method::POST, ["api", "v1", "pending", id, "approve"]) => {
+            match pending::approve(&state.pending_map, id).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"status": "approved"}).to_string(),
+                ),
+                Err(_) => not_found(),
+            }
+        }
+
+        // POST /api/v1/pending/:id/deny - deny a pending connection
+        (Method::POST, ["api", "v1", "pending", id, "deny"]) => {
+            match pending::deny(&state.pending_map, id).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"status": "denied"}).to_string(),
+                ),
+                Err(_) => not_found(),
+            }
+        }
+
         _ => not_found(),
     };
 
@@ -243,6 +274,7 @@ pub async fn start(
     mut shutdown_rx: broadcast::Receiver<bool>,
     is_server: bool,
     default_token: Option<MaskedString>,
+    pending_map: PendingMap,
 ) -> Result<()> {
     let addr: SocketAddr = config
         .bind_addr
@@ -261,6 +293,7 @@ pub async fn start(
         is_server,
         default_token,
         port_range,
+        pending_map,
     });
 
     let listener = TcpListener::bind(addr)

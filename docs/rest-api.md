@@ -119,6 +119,7 @@ curl -X PUT \
 | `token` | string | no | Per-service auth token. Auto-filled from `default_token` if omitted |
 | `type` | string | no | `"tcp"` (default) or `"udp"` |
 | `nodelay` | bool | no | Enable `TCP_NODELAY` |
+| `require_approval` | bool | no | Hold incoming connections until approved (see [Connection Approval](connection-approval.md)) |
 
 **Response:**
 
@@ -147,6 +148,80 @@ curl -X DELETE \
 ```json
 {"status": "deleted"}
 ```
+
+---
+
+### List pending connections
+
+```
+GET /api/v1/pending
+```
+
+Returns all visitor connections currently waiting for approval. Only relevant when services have `require_approval = true`. See [Connection Approval](connection-approval.md) for the full workflow.
+
+```bash
+curl -s -H "Authorization: Bearer my-api-token" \
+  http://127.0.0.1:9090/api/v1/pending | jq
+```
+
+**Response:**
+
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "service_name": "ssh",
+    "visitor_addr": "203.0.113.50:43210",
+    "created_at": 1711000000
+  }
+]
+```
+
+---
+
+### Approve a pending connection
+
+```
+POST /api/v1/pending/:id/approve
+```
+
+Approves a held connection. The visitor's TCP connection is forwarded immediately.
+
+```bash
+curl -X POST -H "Authorization: Bearer my-api-token" \
+  http://127.0.0.1:9090/api/v1/pending/550e8400-e29b-41d4-a716-446655440000/approve
+```
+
+**Response:**
+
+```json
+{"status": "approved"}
+```
+
+Returns `404` if the connection already timed out or was already decided.
+
+---
+
+### Deny a pending connection
+
+```
+POST /api/v1/pending/:id/deny
+```
+
+Denies a held connection. The visitor's TCP connection is dropped.
+
+```bash
+curl -X POST -H "Authorization: Bearer my-api-token" \
+  http://127.0.0.1:9090/api/v1/pending/550e8400-e29b-41d4-a716-446655440000/deny
+```
+
+**Response:**
+
+```json
+{"status": "denied"}
+```
+
+Returns `404` if the connection already timed out or was already decided.
 
 ---
 

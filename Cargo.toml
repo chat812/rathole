@@ -58,7 +58,7 @@ websocket-rustls = [
 hot-reload = ["notify"]
 
 # Runtime REST API
-api = ["hyper", "hyper-util", "http-body-util", "serde_json"]
+api = ["hyper", "hyper-util", "http-body-util", "serde_json", "reqwest"]
 
 # Default feature releasing embedded devices
 # Cross-compiling with tls is hard. So we don't :(
@@ -114,6 +114,8 @@ hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 serde_json = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.11", features = ["json"], optional = true }
 console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",
 ] }

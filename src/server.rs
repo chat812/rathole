@@ -3,6 +3,7 @@ use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
+use crate::pending::{self, PendingMap};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, write_control_cmd, Ack, ControlChannelCmd, DataChannelCmd, Hello,
@@ -45,6 +46,9 @@ pub async fn run_server(
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
     registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -55,13 +59,13 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config, registry).await?;
+            let mut server = Server::<TcpTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config, registry).await?;
+                let mut server = Server::<TlsTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -70,7 +74,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config, registry).await?;
+                let mut server = Server::<NoiseTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -79,7 +83,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config, registry).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -107,6 +111,12 @@ struct Server<T: Transport> {
     transport: Arc<T>,
     // Service registry for tracking service state
     registry: Arc<ServiceRegistry>,
+    // Pending connections awaiting approval
+    pending_map: PendingMap,
+    // Webhook URL for approval notifications
+    approval_webhook: Option<String>,
+    // Timeout in seconds for approval
+    approval_timeout: u64,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -122,7 +132,13 @@ fn generate_service_hashmap(
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig, registry: Arc<ServiceRegistry>) -> Result<Server<T>> {
+    pub async fn from(
+        config: ServerConfig,
+        registry: Arc<ServiceRegistry>,
+        pending_map: PendingMap,
+        approval_webhook: Option<String>,
+        approval_timeout: u64,
+    ) -> Result<Server<T>> {
         // Register initial services
         for (name, svc) in &config.services {
             let svc_type = format!("{:?}", svc.service_type).to_lowercase();
@@ -143,6 +159,7 @@ impl<T: 'static + Transport> Server<T> {
                 token: config.default_token.clone(),
                 nodelay: None,
                 local_addr: None,
+                require_approval: false,
             };
             services_map.insert(protocol::gateway_digest(), gateway_cfg);
         }
@@ -156,6 +173,9 @@ impl<T: 'static + Transport> Server<T> {
             control_channels,
             transport,
             registry,
+            pending_map,
+            approval_webhook,
+            approval_timeout,
         })
     }
 
@@ -216,8 +236,11 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             let registry = self.registry.clone();
+                                            let pending_map = self.pending_map.clone();
+                                            let approval_webhook = self.approval_webhook.clone();
+                                            let approval_timeout = self.approval_timeout;
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry, pending_map, approval_webhook, approval_timeout).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -330,6 +353,9 @@ async fn handle_connection<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
     registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -342,6 +368,9 @@ async fn handle_connection<T: 'static + Transport>(
                 service_digest,
                 server_config,
                 registry,
+                pending_map,
+                approval_webhook,
+                approval_timeout,
             )
             .await?;
         }
@@ -359,6 +388,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
     registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -434,6 +466,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             service_config,
             server_config.heartbeat_interval,
             registry,
+            pending_map,
+            approval_webhook,
+            approval_timeout,
         );
 
         // Push all existing services to a newly connected GATEWAY client only.
@@ -521,6 +556,9 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
         registry: Arc<ServiceRegistry>,
+        pending_map: PendingMap,
+        approval_webhook: Option<String>,
+        approval_timeout: u64,
     ) -> ControlChannelHandle<T> {
         let is_gateway = service.name == GATEWAY_SERVICE_NAME;
 
@@ -549,6 +587,8 @@ where
 
             let shutdown_rx_clone = shutdown_tx.subscribe();
             let bind_addr = service.bind_addr.clone();
+            let service_name = service.name.clone();
+            let require_approval = service.require_approval;
             let pool_req_tx = data_ch_req_tx.clone();
             match service.service_type {
                 ServiceType::Tcp => tokio::spawn(
@@ -558,6 +598,11 @@ where
                             data_ch_rx,
                             pool_req_tx,
                             shutdown_rx_clone,
+                            pending_map,
+                            service_name,
+                            require_approval,
+                            approval_webhook,
+                            approval_timeout,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -688,6 +733,11 @@ fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    pending_map: PendingMap,
+    service_name: String,
+    require_approval: bool,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> mpsc::Receiver<TcpStream> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
@@ -734,19 +784,71 @@ fn tcp_listen_and_send(
                             }
                         }
                         Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
-                            }
-
                             backoff.reset();
-
                             debug!("New visitor from {}", addr);
 
-                            // Send the visitor to the connection pool
-                            let _ = tx.send(incoming).await;
+                            if require_approval {
+                                // Hold the connection and wait for approval
+                                let (id, approval_rx) = pending::insert(
+                                    &pending_map, &service_name, addr.to_string()
+                                ).await;
+
+                                info!("Pending approval {} for visitor {} on service {}", id, addr, service_name);
+
+                                // Fire webhook notification (fire-and-forget)
+                                #[cfg(feature = "api")]
+                                if let Some(ref webhook_url) = approval_webhook {
+                                    let url = webhook_url.clone();
+                                    let svc = service_name.clone();
+                                    let visitor = addr.to_string();
+                                    let pending_id = id.clone();
+                                    tokio::spawn(async move {
+                                        let payload = serde_json::json!({
+                                            "id": pending_id,
+                                            "service_name": svc,
+                                            "visitor_addr": visitor,
+                                        });
+                                        if let Err(e) = reqwest::Client::new()
+                                            .post(&url)
+                                            .json(&payload)
+                                            .timeout(Duration::from_secs(5))
+                                            .send()
+                                            .await
+                                        {
+                                            warn!("Failed to send approval webhook: {}", e);
+                                        }
+                                    });
+                                }
+
+                                // Spawn a task to wait for approval
+                                let tx_clone = tx.clone();
+                                let data_ch_req_tx_clone = data_ch_req_tx.clone();
+                                let timeout_dur = Duration::from_secs(approval_timeout);
+                                tokio::spawn(async move {
+                                    match time::timeout(timeout_dur, approval_rx).await {
+                                        Ok(Ok(true)) => {
+                                            // Approved - request data channel and send visitor
+                                            if data_ch_req_tx_clone.send(true).is_ok() {
+                                                let _ = tx_clone.send(incoming).await;
+                                            }
+                                            info!("Connection from {} approved", addr);
+                                        }
+                                        _ => {
+                                            // Denied, timed out, or oneshot dropped
+                                            info!("Connection from {} denied/timed out", addr);
+                                            drop(incoming);
+                                        }
+                                    }
+                                });
+                            } else {
+                                // Original behavior: immediate forwarding
+                                if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                                    // An error indicates the control channel is broken
+                                    break;
+                                }
+                                // Send the visitor to the connection pool
+                                let _ = tx.send(incoming).await;
+                            }
                         }
                     }
                 },
@@ -768,8 +870,22 @@ async fn run_tcp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
+    pending_map: PendingMap,
+    service_name: String,
+    require_approval: bool,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx = tcp_listen_and_send(
+        bind_addr,
+        data_ch_req_tx.clone(),
+        shutdown_rx,
+        pending_map,
+        service_name,
+        require_approval,
+        approval_webhook,
+        approval_timeout,
+    );
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {

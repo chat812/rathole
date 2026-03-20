@@ -108,6 +108,9 @@ pub struct ServerServiceConfig {
     /// so they know where to forward traffic without needing their own config.
     #[serde(default)]
     pub local_addr: Option<String>,
+    /// Whether incoming visitor connections require approval before forwarding.
+    #[serde(default)]
+    pub require_approval: bool,
 }
 
 impl ServerServiceConfig {
@@ -226,6 +229,10 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_approval_timeout() -> u64 {
+    60
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -251,6 +258,11 @@ pub struct ApiConfig {
     pub port_range_min: Option<u16>,
     /// Maximum allowed bind port for tunnels (inclusive)
     pub port_range_max: Option<u16>,
+    /// URL to POST webhook notifications for pending connections
+    pub approval_webhook: Option<String>,
+    /// Timeout in seconds for approval (default 60)
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

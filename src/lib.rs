@@ -6,6 +6,7 @@ mod config_watcher;
 mod constants;
 mod helper;
 mod multi_map;
+mod pending;
 mod protocol;
 mod registry;
 mod transport;
@@ -83,6 +84,9 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // Service registry shared across API server and instances
     let registry = Arc::new(ServiceRegistry::new());
 
+    // Pending connections map shared across API and server
+    let pending_map = pending::new_pending_map();
+
     // Channel for API-originated config changes
     let (api_event_tx, mut api_event_rx) =
         mpsc::unbounded_channel::<ConfigChange>();
@@ -124,6 +128,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                             let api_tx = api_event_tx.clone();
                             let api_registry = registry.clone();
                             let api_shutdown = shutdown_tx.subscribe();
+                            let api_pending = pending_map.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = api::start(
                                     api_cfg,
@@ -132,6 +137,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                     api_shutdown,
                                     is_server,
                                     default_token,
+                                    api_pending,
                                 ).await {
                                     error!("API server error: {:#}", e);
                                 }
@@ -140,6 +146,10 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
 
                         let (service_update_tx, service_update_rx) = mpsc::channel(1024);
 
+                        // Extract approval config from API section
+                        let approval_webhook = config.api.as_ref().and_then(|a| a.approval_webhook.clone());
+                        let approval_timeout = config.api.as_ref().map(|a| a.approval_timeout).unwrap_or(60);
+
                         last_instance = Some((
                             tokio::spawn(run_instance(
                                 *config,
@@ -147,6 +157,9 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                 shutdown_tx.subscribe(),
                                 service_update_rx,
                                 registry.clone(),
+                                pending_map.clone(),
+                                approval_webhook,
+                                approval_timeout,
                             )),
                             service_update_tx,
                         ));
@@ -182,6 +195,9 @@ async fn run_instance(
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
     registry: Arc<ServiceRegistry>,
+    pending_map: pending::PendingMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -195,7 +211,7 @@ async fn run_instance(
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update, registry).await
+            run_server(config, shutdown_rx, service_update, registry, pending_map, approval_webhook, approval_timeout).await
         }
     }
 }
