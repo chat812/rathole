@@ -33,6 +33,19 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
+/// Permanent error: the server rejected the service because it doesn't exist.
+/// The client should stop retrying and remove this service.
+#[derive(Debug)]
+struct ServiceNotExistError(String);
+
+impl std::fmt::Display for ServiceNotExistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Service '{}' does not exist on the server", self.0)
+    }
+}
+
+impl std::error::Error for ServiceNotExistError {}
+
 // The entrypoint of running a client
 pub async fn run_client(
     config: Config,
@@ -525,6 +538,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Reading ack");
         match read_ack(&mut conn).await? {
             Ack::Ok => {}
+            Ack::ServiceNotExist => {
+                return Err(ServiceNotExistError(self.service.name.clone()).into());
+            }
             v => {
                 return Err(anyhow!("{}", v))
                     .with_context(|| format!("Authentication failed: {}", self.service.name));
@@ -632,6 +648,16 @@ impl ControlChannelHandle {
                     .with_context(|| "Failed to run the control channel")
                 {
                     if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+                        break;
+                    }
+
+                    // If the server says the service doesn't exist, stop retrying
+                    // and tell the client to remove this service
+                    if err.downcast_ref::<ServiceNotExistError>().is_some() {
+                        warn!("{:#}. Removing service and stopping retries.", err);
+                        let _ = s.push_event_tx.send(
+                            ConfigChange::ClientChange(ClientServiceChange::Delete(s.service.name.clone()))
+                        );
                         break;
                     }
 
