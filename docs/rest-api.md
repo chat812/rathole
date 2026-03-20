@@ -120,6 +120,7 @@ curl -X PUT \
 | `type` | string | no | `"tcp"` (default) or `"udp"` |
 | `nodelay` | bool | no | Enable `TCP_NODELAY` |
 | `require_approval` | bool | no | Hold incoming connections until approved (see [Connection Approval](connection-approval.md)) |
+| `agent_id` | string | no | Tag this service to a specific agent (see [Multi-Agent](multi-agent.md)). Only pushed to that agent's gateway. |
 
 **Response:**
 
@@ -222,6 +223,85 @@ curl -X POST -H "Authorization: Bearer my-api-token" \
 ```
 
 Returns `404` if the connection already timed out or was already decided.
+
+---
+
+### Register an agent
+
+```
+PUT /api/v1/agents/:agent_id
+```
+
+Creates a per-agent gateway service so the agent's client can connect. See [Multi-Agent](multi-agent.md) for the full workflow.
+
+```bash
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"token": "agent-unique-token"}' \
+  http://127.0.0.1:9090/api/v1/agents/abc123
+```
+
+**Response:** `{"status": "registered", "agent_id": "abc123"}`
+
+---
+
+### Unregister an agent
+
+```
+DELETE /api/v1/agents/:agent_id
+```
+
+Removes the agent's gateway service. The controller should delete owned tunnels before calling this.
+
+---
+
+### List agents
+
+```
+GET /api/v1/agents
+```
+
+Returns all registered agent gateway services with their state.
+
+---
+
+### Create a setup code
+
+```
+POST /api/v1/setup
+```
+
+Creates a one-time setup code for agent auto-configuration. Codes expire after 10 minutes.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"agent_id": "abc123", "token": "agent-unique-token", "setup_code": "ABCD-1234"}' \
+  http://127.0.0.1:9090/api/v1/setup
+```
+
+---
+
+### Claim a setup code
+
+```
+GET /api/v1/setup/:code
+```
+
+**No authentication required.** Returns the client config and deletes the code (single-use).
+
+```bash
+curl http://158.178.234.87:9090/api/v1/setup/ABCD-1234
+```
+
+**Response:**
+```json
+{
+  "remote_addr": "0.0.0.0:2333",
+  "token": "agent-unique-token",
+  "agent_id": "abc123"
+}
+```
+
+Returns `404` if the code is invalid, expired, or already used.
 
 ---
 
