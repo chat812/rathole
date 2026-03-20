@@ -3,7 +3,7 @@ use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
-use crate::pending::{self, PendingMap};
+use crate::pending::{self, ApprovedMap, PendingMap};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, write_control_cmd, Ack, ControlChannelCmd, DataChannelCmd, Hello,
@@ -47,6 +47,7 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
     registry: Arc<ServiceRegistry>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
     approval_webhook: Option<String>,
     approval_timeout: u64,
 ) -> Result<()> {
@@ -59,13 +60,13 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
+            let mut server = Server::<TcpTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
+                let mut server = Server::<TlsTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -74,7 +75,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
+                let mut server = Server::<NoiseTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -83,7 +84,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config, registry, pending_map, approval_webhook, approval_timeout).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -113,6 +114,8 @@ struct Server<T: Transport> {
     registry: Arc<ServiceRegistry>,
     // Pending connections awaiting approval
     pending_map: PendingMap,
+    // Approved IPs per service
+    approved_map: ApprovedMap,
     // Webhook URL for approval notifications
     approval_webhook: Option<String>,
     // Timeout in seconds for approval
@@ -136,6 +139,7 @@ impl<T: 'static + Transport> Server<T> {
         config: ServerConfig,
         registry: Arc<ServiceRegistry>,
         pending_map: PendingMap,
+        approved_map: ApprovedMap,
         approval_webhook: Option<String>,
         approval_timeout: u64,
     ) -> Result<Server<T>> {
@@ -174,6 +178,7 @@ impl<T: 'static + Transport> Server<T> {
             transport,
             registry,
             pending_map,
+            approved_map,
             approval_webhook,
             approval_timeout,
         })
@@ -237,10 +242,11 @@ impl<T: 'static + Transport> Server<T> {
                                             let server_config = self.config.clone();
                                             let registry = self.registry.clone();
                                             let pending_map = self.pending_map.clone();
+                                            let approved_map = self.approved_map.clone();
                                             let approval_webhook = self.approval_webhook.clone();
                                             let approval_timeout = self.approval_timeout;
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry, pending_map, approval_webhook, approval_timeout).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -323,6 +329,9 @@ impl<T: 'static + Transport> Server<T> {
                 ServerServiceChange::Delete(s) => {
                     self.registry.unregister(&s).await;
 
+                    // Clear approved IPs for this service
+                    pending::clear_approved(&self.approved_map, &s).await;
+
                     // Push RemoveService to gateway clients only
                     let cmd = ControlChannelCmd::RemoveService(s.clone());
                     {
@@ -354,6 +363,7 @@ async fn handle_connection<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     registry: Arc<ServiceRegistry>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
     approval_webhook: Option<String>,
     approval_timeout: u64,
 ) -> Result<()> {
@@ -369,6 +379,7 @@ async fn handle_connection<T: 'static + Transport>(
                 server_config,
                 registry,
                 pending_map,
+                approved_map,
                 approval_webhook,
                 approval_timeout,
             )
@@ -389,6 +400,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     registry: Arc<ServiceRegistry>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
     approval_webhook: Option<String>,
     approval_timeout: u64,
 ) -> Result<()> {
@@ -467,6 +479,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             server_config.heartbeat_interval,
             registry,
             pending_map,
+            approved_map,
             approval_webhook,
             approval_timeout,
         );
@@ -557,6 +570,7 @@ where
         heartbeat_interval: u64,
         registry: Arc<ServiceRegistry>,
         pending_map: PendingMap,
+        approved_map: ApprovedMap,
         approval_webhook: Option<String>,
         approval_timeout: u64,
     ) -> ControlChannelHandle<T> {
@@ -599,6 +613,7 @@ where
                             pool_req_tx,
                             shutdown_rx_clone,
                             pending_map,
+                            approved_map,
                             service_name,
                             require_approval,
                             approval_webhook,
@@ -734,6 +749,7 @@ fn tcp_listen_and_send(
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
     service_name: String,
     require_approval: bool,
     approval_webhook: Option<String>,
@@ -787,7 +803,7 @@ fn tcp_listen_and_send(
                             backoff.reset();
                             debug!("New visitor from {}", addr);
 
-                            if require_approval {
+                            if require_approval && !pending::is_approved(&approved_map, &service_name, addr.ip()).await {
                                 // Hold the connection and wait for approval
                                 let (id, approval_rx) = pending::insert(
                                     &pending_map, &service_name, addr.to_string()
@@ -871,6 +887,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
     service_name: String,
     require_approval: bool,
     approval_webhook: Option<String>,
@@ -881,6 +898,7 @@ async fn run_tcp_connection_pool<T: Transport>(
         data_ch_req_tx.clone(),
         shutdown_rx,
         pending_map,
+        approved_map,
         service_name,
         require_approval,
         approval_webhook,

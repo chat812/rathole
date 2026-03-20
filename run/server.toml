@@ -7,3 +7,5 @@ bind_addr = "127.0.0.1:9090"
 # token = "my-api-token"
 port_range_min = 10000
 port_range_max = 14000
+approval_webhook = "http://127.0.0.1:8090/webhook/connection"
+approval_timeout = 60

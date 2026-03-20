@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, RwLock};
@@ -54,12 +55,19 @@ pub async fn insert(
 }
 
 /// Approve a pending connection (sends true on the oneshot).
-pub async fn approve(map: &PendingMap, id: &str) -> Result<()> {
+/// Also records the visitor IP in the approved map for future connections.
+pub async fn approve(map: &PendingMap, approved_map: &ApprovedMap, id: &str) -> Result<()> {
     let conn = map
         .write()
         .await
         .remove(id)
         .ok_or_else(|| anyhow!("Pending connection not found"))?;
+
+    // Extract IP from visitor_addr (format "ip:port")
+    if let Ok(addr) = conn.info.visitor_addr.parse::<std::net::SocketAddr>() {
+        add_approved(approved_map, &conn.info.service_name, addr.ip()).await;
+    }
+
     let _ = conn.response_tx.send(true);
     Ok(())
 }
@@ -82,6 +90,38 @@ pub async fn list(map: &PendingMap) -> Vec<PendingInfo> {
         .values()
         .map(|c| c.info.clone())
         .collect()
+}
+
+// --- Approved IPs per service ---
+
+/// Map of service_name -> set of approved IPs.
+pub type ApprovedMap = Arc<RwLock<HashMap<String, HashSet<IpAddr>>>>;
+
+pub fn new_approved_map() -> ApprovedMap {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Check if an IP is already approved for a service.
+pub async fn is_approved(map: &ApprovedMap, service_name: &str, ip: IpAddr) -> bool {
+    map.read()
+        .await
+        .get(service_name)
+        .map(|set| set.contains(&ip))
+        .unwrap_or(false)
+}
+
+/// Mark an IP as approved for a service.
+pub async fn add_approved(map: &ApprovedMap, service_name: &str, ip: IpAddr) {
+    map.write()
+        .await
+        .entry(service_name.to_string())
+        .or_default()
+        .insert(ip);
+}
+
+/// Clear all approved IPs for a service (called when service is removed).
+pub async fn clear_approved(map: &ApprovedMap, service_name: &str) {
+    map.write().await.remove(service_name);
 }
 
 /// Remove expired pending connections. Dropping the sender signals denial.

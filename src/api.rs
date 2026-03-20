@@ -1,6 +1,6 @@
 use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig};
 use crate::config_watcher::{ClientServiceChange, ConfigChange, ServerServiceChange};
-use crate::pending::{self, PendingMap};
+use crate::pending::{self, ApprovedMap, PendingMap};
 use crate::registry::ServiceRegistry;
 
 use anyhow::{Context, Result};
@@ -67,6 +67,8 @@ struct ApiState {
     port_range: Option<(u16, u16)>,
     /// Shared pending connections map
     pending_map: PendingMap,
+    /// Approved IPs per service
+    approved_map: ApprovedMap,
 }
 
 /// Extract the port from a bind address like "0.0.0.0:5022".
@@ -240,7 +242,7 @@ async fn handle_request(
 
         // POST /api/v1/pending/:id/approve - approve a pending connection
         (Method::POST, ["api", "v1", "pending", id, "approve"]) => {
-            match pending::approve(&state.pending_map, id).await {
+            match pending::approve(&state.pending_map, &state.approved_map, id).await {
                 Ok(()) => json_response(
                     StatusCode::OK,
                     &serde_json::json!({"status": "approved"}).to_string(),
@@ -275,6 +277,7 @@ pub async fn start(
     is_server: bool,
     default_token: Option<MaskedString>,
     pending_map: PendingMap,
+    approved_map: ApprovedMap,
 ) -> Result<()> {
     let addr: SocketAddr = config
         .bind_addr
@@ -294,6 +297,7 @@ pub async fn start(
         default_token,
         port_range,
         pending_map,
+        approved_map,
     });
 
     let listener = TcpListener::bind(addr)

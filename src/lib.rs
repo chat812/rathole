@@ -86,6 +86,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
 
     // Pending connections map shared across API and server
     let pending_map = pending::new_pending_map();
+    let approved_map = pending::new_approved_map();
 
     // Channel for API-originated config changes
     let (api_event_tx, mut api_event_rx) =
@@ -129,6 +130,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                             let api_registry = registry.clone();
                             let api_shutdown = shutdown_tx.subscribe();
                             let api_pending = pending_map.clone();
+                            let api_approved = approved_map.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = api::start(
                                     api_cfg,
@@ -138,6 +140,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                     is_server,
                                     default_token,
                                     api_pending,
+                                    api_approved,
                                 ).await {
                                     error!("API server error: {:#}", e);
                                 }
@@ -158,6 +161,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                                 service_update_rx,
                                 registry.clone(),
                                 pending_map.clone(),
+                                approved_map.clone(),
                                 approval_webhook,
                                 approval_timeout,
                             )),
@@ -196,6 +200,7 @@ async fn run_instance(
     service_update: mpsc::Receiver<ConfigChange>,
     registry: Arc<ServiceRegistry>,
     pending_map: pending::PendingMap,
+    approved_map: pending::ApprovedMap,
     approval_webhook: Option<String>,
     approval_timeout: u64,
 ) -> Result<()> {
@@ -211,7 +216,7 @@ async fn run_instance(
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update, registry, pending_map, approval_webhook, approval_timeout).await
+            run_server(config, shutdown_rx, service_update, registry, pending_map, approved_map, approval_webhook, approval_timeout).await
         }
     }
 }
